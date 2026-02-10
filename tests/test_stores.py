@@ -41,9 +41,9 @@ class TestS3Store:
 
         store = S3Store(bucket="mybucket")
         store.upload("/tmp/file.sql.gz", "prefix/file.sql.gz")
-        mock_client.upload_file.assert_called_once_with(
-            "/tmp/file.sql.gz", "mybucket", "prefix/file.sql.gz"
-        )
+        args, kwargs = mock_client.upload_file.call_args
+        assert args == ("/tmp/file.sql.gz", "mybucket", "prefix/file.sql.gz")
+        assert "Config" in kwargs
         mock_client.head_object.assert_called_once_with(
             Bucket="mybucket", Key="prefix/file.sql.gz"
         )
@@ -67,9 +67,9 @@ class TestS3Store:
 
         store = S3Store(bucket="mybucket")
         store.download("prefix/file.sql.gz", "/tmp/file.sql.gz")
-        mock_client.download_file.assert_called_once_with(
-            "mybucket", "prefix/file.sql.gz", "/tmp/file.sql.gz"
-        )
+        args, kwargs = mock_client.download_file.call_args
+        assert args == ("mybucket", "prefix/file.sql.gz", "/tmp/file.sql.gz")
+        assert "Config" in kwargs
 
     @patch("stores.s3.boto3")
     def test_list(self, mock_boto):

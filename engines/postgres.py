@@ -446,7 +446,7 @@ class PostgresEngine(Engine):
                 restore_proc = subprocess.Popen(
                     pg_restore_cmd,
                     stdin=decompress_proc.stdout,
-                    stdout=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                 )
                 decompress_proc.stdout.close()
@@ -454,7 +454,7 @@ class PostgresEngine(Engine):
         else:
             restore_proc = subprocess.Popen(
                 pg_restore_cmd + [file_path],
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
             self._wait_pipeline([restore_proc], timeout)

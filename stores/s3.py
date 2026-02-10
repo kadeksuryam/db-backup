@@ -6,6 +6,7 @@ import logging
 import os
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config as BotoConfig
 
 from config import ConfigError
@@ -23,6 +24,7 @@ class S3Store(Store):
         access_key: str = "",
         secret_key: str = "",
         region: str = "auto",
+        max_concurrency: int = 4,
     ):
         session = boto3.session.Session(
             aws_access_key_id=access_key,
@@ -40,11 +42,12 @@ class S3Store(Store):
 
         self._client = session.client("s3", **client_kwargs)
         self._bucket = bucket
+        self._transfer_config = TransferConfig(max_concurrency=max_concurrency)
 
     def upload(self, local_path: str, remote_key: str) -> None:
         log.info("Uploading %s -> s3://%s/%s", local_path, self._bucket, remote_key)
         local_size = os.path.getsize(local_path)
-        self._client.upload_file(local_path, self._bucket, remote_key)
+        self._client.upload_file(local_path, self._bucket, remote_key, Config=self._transfer_config)
 
         # Verify uploaded object size matches the local file
         resp = self._client.head_object(Bucket=self._bucket, Key=remote_key)
@@ -59,7 +62,7 @@ class S3Store(Store):
         log.info(
             "Downloading s3://%s/%s -> %s", self._bucket, remote_key, local_path
         )
-        self._client.download_file(self._bucket, remote_key, local_path)
+        self._client.download_file(self._bucket, remote_key, local_path, Config=self._transfer_config)
 
     def list(self, prefix: str) -> list[BackupInfo]:
         backups: list[BackupInfo] = []
@@ -100,4 +103,5 @@ def create(config: dict) -> S3Store:
         access_key=config.get("access_key", ""),
         secret_key=config.get("secret_key", ""),
         region=config.get("region", "auto"),
+        max_concurrency=int(config.get("max_concurrency", 4)),
     )

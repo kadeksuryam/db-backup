@@ -1,0 +1,82 @@
+# dbbackup configuration
+#
+# Each datasource requires an 'engine' field to select the database backend.
+# Supported engines: postgres (more coming soon: mysql, mongodb, ...)
+#
+# Engine-specific options (e.g. pg_version) are passed through to the engine.
+# For PostgreSQL, build the image with all client versions you need:
+#   docker build --build-arg PG_VERSIONS="14 17" -t dbbackup .
+#
+# Secrets: use *_env keys to reference environment variables instead of
+# hardcoding credentials. E.g. 'password_env: MY_SECRET' resolves the
+# value of $MY_SECRET at runtime.
+
+datasources:
+  # PostgreSQL datasource
+  appdb:
+    engine: postgres
+    host: db.example.com
+    port: 5432
+    user: postgres
+    password_env: APPDB_PASSWORD      # reads $APPDB_PASSWORD
+    database: appdb
+    pg_version: 17                    # uses /usr/lib/postgresql/17/bin/pg_dump
+
+  analyticsdb:
+    engine: postgres
+    host: analytics-db.internal
+    port: 5432
+    user: analytics
+    password_env: ANALYTICS_PASSWORD
+    database: analytics
+    pg_version: 14                    # uses /usr/lib/postgresql/14/bin/pg_dump
+
+stores:
+  # S3-compatible storage (Cloudflare R2, AWS S3, MinIO, etc.)
+  r2:
+    type: s3
+    endpoint: https://your-account-id.r2.cloudflarestorage.com
+    bucket: db-backups
+    access_key_env: R2_ACCESS_KEY
+    secret_key_env: R2_SECRET_KEY
+    # region: auto                    # optional, defaults to 'auto'
+
+  # SSH/scp remote host
+  backup-server:
+    type: ssh
+    host: backup.example.com
+    user: backup
+    port: 22
+    path: /data/db-backups
+    # key_file: /keys/id_ed25519     # optional, defaults to ssh-agent
+
+jobs:
+  # Each job links a datasource to a store with a prefix and retention policy.
+  # The backup path in the store will be: <prefix>/<database>/<timestamp>.sql.gz
+
+  appdb-to-r2:
+    datasource: appdb
+    store: r2
+    prefix: prod
+    retention:
+      keep_last: 3                   # always keep the 3 most recent
+      keep_daily: 7                  # keep 1 per day for the last 7 days
+      keep_weekly: 4                 # keep 1 per week for the last 4 weeks
+      keep_monthly: 6               # keep 1 per month for the last 6 months
+      keep_yearly: 1                 # keep 1 per year for the last year
+
+  appdb-to-ssh:
+    datasource: appdb
+    store: backup-server
+    prefix: prod
+    retention:
+      keep_last: 5
+      keep_daily: 14
+
+  analytics-daily:
+    datasource: analyticsdb
+    store: r2
+    prefix: analytics
+    retention:
+      keep_last: 2
+      keep_daily: 30

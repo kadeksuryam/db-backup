@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.python-version
+
+# Config files may contain credentials — never commit
+config.yaml
+config.yml
+*.env

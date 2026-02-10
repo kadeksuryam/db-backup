@@ -25,6 +25,70 @@ def _validate_identifier(name: str) -> None:
         )
 
 
+# Mapping: compression name → (compress_cmd_template, decompress_cmd_template, extension, default_level)
+# Templates use {level} as a placeholder for the level flag.
+_COMPRESSION_TOOLS: dict[str, tuple[list[str], list[str], str, int]] = {
+    "gzip":  (["gzip", "-{level}"],        ["gunzip", "-c"],    ".gz",  6),
+    "zstd":  (["zstd", "-{level}", "-c"],   ["zstd", "-d", "-c"], ".zst", 3),
+    "lz4":   (["lz4", "-{level}", "-c"],    ["lz4", "-d", "-c"],  ".lz4", 1),
+}
+
+_VALID_FORMATS = {"plain", "custom"}
+
+# Extension → (format, compression) mapping for restore detection.
+_EXTENSION_MAP: dict[str, tuple[str, str]] = {
+    ".sql.gz":   ("plain",  "gzip"),
+    ".sql.zst":  ("plain",  "zstd"),
+    ".sql.lz4":  ("plain",  "lz4"),
+    ".sql":      ("plain",  "none"),
+    ".dump.gz":  ("custom", "gzip"),
+    ".dump.zst": ("custom", "zstd"),
+    ".dump.lz4": ("custom", "lz4"),
+    ".dump":     ("custom", "none"),
+}
+
+
+def _resolve_format(ds: Datasource) -> str:
+    """Return the dump format from datasource options, defaulting to 'plain'."""
+    fmt = ds.options.get("format", "plain")
+    if fmt not in _VALID_FORMATS:
+        raise ValueError(
+            f"Invalid format '{fmt}'. Supported: {', '.join(sorted(_VALID_FORMATS))}"
+        )
+    return fmt
+
+
+def _resolve_compression(ds: Datasource) -> tuple[list[str] | None, list[str] | None, str]:
+    """Return (compress_cmd, decompress_cmd, extension) from datasource options.
+
+    Returns (None, None, "") when compression is "none".
+    """
+    compression = ds.options.get("compression", "gzip")
+    if compression == "none":
+        return None, None, ""
+    if compression not in _COMPRESSION_TOOLS:
+        raise ValueError(
+            f"Invalid compression '{compression}'. "
+            f"Supported: {', '.join(sorted(_COMPRESSION_TOOLS))}, none"
+        )
+    compress_tpl, decompress_cmd, ext, default_level = _COMPRESSION_TOOLS[compression]
+    level = ds.options.get("compression_level", default_level)
+    compress_cmd = [part.replace("{level}", str(level)) for part in compress_tpl]
+    return compress_cmd, list(decompress_cmd), ext
+
+
+def _detect_from_extension(filename: str) -> tuple[str, str]:
+    """Detect (format, compression) from a backup filename extension.
+
+    Raises ValueError for unrecognized extensions.
+    """
+    # Check compound extensions first (they are listed first in the map)
+    for ext, (fmt, comp) in _EXTENSION_MAP.items():
+        if filename.endswith(ext):
+            return fmt, comp
+    raise ValueError(f"Unrecognized backup file extension: {filename}")
+
+
 class PostgresEngine(Engine):
 
     # -- private helpers --------------------------------------------------
@@ -103,26 +167,42 @@ class PostgresEngine(Engine):
 
     def dump(self, ds: Datasource, output_path: str) -> None:
         pg_env = self._pg_env(ds)
+        fmt = _resolve_format(ds)
+        compress_cmd, _, _ = _resolve_compression(ds)
+
+        pg_dump_cmd = [self._pg_bin(ds, "pg_dump"), "--no-owner", "--no-privileges"]
+        if fmt == "custom":
+            pg_dump_cmd.extend(["-Fc", "-Z0"])
 
         # Open with 0o600 to prevent other users from reading database dumps
         fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as outfile:
-            dump_proc = subprocess.Popen(
-                [self._pg_bin(ds, "pg_dump"), "--no-owner", "--no-privileges"],
-                env=pg_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            gzip_proc = subprocess.Popen(
-                ["gzip", "-6"],
-                stdin=dump_proc.stdout,
-                stdout=outfile,
-                stderr=subprocess.PIPE,
-            )
-            # Allow dump to receive SIGPIPE if gzip exits early
-            dump_proc.stdout.close()
-            gzip_proc.wait()
-            dump_proc.wait()
+            if compress_cmd is not None:
+                dump_proc = subprocess.Popen(
+                    pg_dump_cmd,
+                    env=pg_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                compress_proc = subprocess.Popen(
+                    compress_cmd,
+                    stdin=dump_proc.stdout,
+                    stdout=outfile,
+                    stderr=subprocess.PIPE,
+                )
+                # Allow dump to receive SIGPIPE if compressor exits early
+                dump_proc.stdout.close()
+                compress_proc.wait()
+                dump_proc.wait()
+            else:
+                # No compression — write pg_dump output directly
+                dump_proc = subprocess.Popen(
+                    pg_dump_cmd,
+                    env=pg_env,
+                    stdout=outfile,
+                    stderr=subprocess.PIPE,
+                )
+                dump_proc.wait()
 
         if dump_proc.returncode != 0:
             stderr = dump_proc.stderr.read().decode().strip() if dump_proc.stderr else ""
@@ -131,27 +211,57 @@ class PostgresEngine(Engine):
     def restore(self, ds: Datasource, input_path: str) -> None:
         env = self._pg_env(ds)
 
-        with open(input_path, "rb") as infile:
-            gunzip = subprocess.Popen(
-                ["gunzip", "-c"],
-                stdin=infile,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            psql = subprocess.Popen(
-                [self._pg_bin(ds, "psql"), "--single-transaction", "--set", "ON_ERROR_STOP=1"],
-                env=env,
-                stdin=gunzip.stdout,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            gunzip.stdout.close()
-            psql_out, psql_err = psql.communicate()
-            gunzip.wait()
+        # Detect format and compression from the file extension, not from
+        # ds.options — this allows restoring old backups with different settings.
+        fmt, compression = _detect_from_extension(input_path)
 
-        if psql.returncode != 0:
+        if fmt == "plain":
+            restore_cmd = [
+                self._pg_bin(ds, "psql"),
+                "--single-transaction", "--set", "ON_ERROR_STOP=1",
+            ]
+        else:
+            restore_cmd = [
+                self._pg_bin(ds, "pg_restore"),
+                "--no-owner", "--no-privileges",
+            ]
+
+        if compression != "none":
+            _, decompress_cmd, _, _ = _COMPRESSION_TOOLS[compression]
+            decompress_cmd = list(decompress_cmd)
+
+            with open(input_path, "rb") as infile:
+                decompress_proc = subprocess.Popen(
+                    decompress_cmd,
+                    stdin=infile,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                restore_proc = subprocess.Popen(
+                    restore_cmd,
+                    env=env,
+                    stdin=decompress_proc.stdout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                decompress_proc.stdout.close()
+                restore_out, restore_err = restore_proc.communicate()
+                decompress_proc.wait()
+        else:
+            with open(input_path, "rb") as infile:
+                restore_proc = subprocess.Popen(
+                    restore_cmd,
+                    env=env,
+                    stdin=infile,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                restore_out, restore_err = restore_proc.communicate()
+
+        if restore_proc.returncode != 0:
+            tool = "psql" if fmt == "plain" else "pg_restore"
             raise RuntimeError(
-                f"psql restore failed (exit {psql.returncode}): {psql_err.decode().strip()}"
+                f"{tool} restore failed (exit {restore_proc.returncode}): {restore_err.decode().strip()}"
             )
 
     def count_tables(self, ds: Datasource) -> int:
@@ -192,8 +302,11 @@ class PostgresEngine(Engine):
         if result.returncode != 0:
             raise RuntimeError(f"Failed to recreate database: {result.stderr.strip()}")
 
-    def file_extension(self) -> str:
-        return ".sql.gz"
+    def file_extension(self, ds: Datasource) -> str:
+        fmt = _resolve_format(ds)
+        _, _, comp_ext = _resolve_compression(ds)
+        base = ".sql" if fmt == "plain" else ".dump"
+        return f"{base}{comp_ext}"
 
 
 def create() -> PostgresEngine:

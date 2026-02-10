@@ -7,7 +7,7 @@ import logging
 import boto3
 from botocore.config import Config as BotoConfig
 
-from . import BackupInfo, Store, parse_timestamp
+from . import BackupInfo, Store, is_backup_file, parse_timestamp
 
 log = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ class S3Store(Store):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
                 filename = key.rsplit("/", 1)[-1]
-                if not filename.endswith(".sql.gz"):
+                if not is_backup_file(filename):
                     continue
                 ts = parse_timestamp(filename)
                 if ts is None:

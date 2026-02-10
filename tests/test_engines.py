@@ -9,7 +9,10 @@ import pytest
 
 from config import Datasource
 from engines import create_engine, Engine
-from engines.postgres import PostgresEngine, _validate_identifier
+from engines.postgres import (
+    PostgresEngine, _validate_identifier, _detect_from_extension,
+    _resolve_format, _resolve_compression,
+)
 
 
 def _ds(**overrides) -> Datasource:
@@ -210,6 +213,10 @@ class TestPostgresEngine:
         assert mock_gzip.wait.called
         assert mock_dump.wait.called
 
+        # Default options: pg_dump should NOT contain -Fc
+        pg_dump_cmd = mock_popen.call_args_list[0][0][0]
+        assert "-Fc" not in pg_dump_cmd
+
     @patch("engines.postgres.subprocess.Popen")
     def test_dump_failure_raises(self, mock_popen, tmp_path):
         outfile = tmp_path / "test.sql.gz"
@@ -304,7 +311,306 @@ class TestPostgresEngine:
     # -- file_extension ---------------------------------------------------
 
     def test_file_extension(self):
-        assert PostgresEngine().file_extension() == ".sql.gz"
+        assert PostgresEngine().file_extension(_ds()) == ".sql.gz"
+
+    # -- file_extension matrix (all 8 combos) -----------------------------
+
+    @pytest.mark.parametrize("fmt,comp,expected", [
+        ("plain",  "gzip",  ".sql.gz"),
+        ("plain",  "zstd",  ".sql.zst"),
+        ("plain",  "lz4",   ".sql.lz4"),
+        ("plain",  "none",  ".sql"),
+        ("custom", "gzip",  ".dump.gz"),
+        ("custom", "zstd",  ".dump.zst"),
+        ("custom", "lz4",   ".dump.lz4"),
+        ("custom", "none",  ".dump"),
+    ])
+    def test_file_extension_matrix(self, fmt, comp, expected):
+        ds = _ds(options={"format": fmt, "compression": comp})
+        assert PostgresEngine().file_extension(ds) == expected
+
+    # -- invalid format / compression -------------------------------------
+
+    def test_invalid_format_raises(self):
+        ds = _ds(options={"format": "tar"})
+        with pytest.raises(ValueError, match="Invalid format 'tar'"):
+            PostgresEngine().file_extension(ds)
+
+    def test_invalid_compression_raises(self):
+        ds = _ds(options={"compression": "bzip2"})
+        with pytest.raises(ValueError, match="Invalid compression 'bzip2'"):
+            PostgresEngine().file_extension(ds)
+
+    # -- dump with custom format ------------------------------------------
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_dump_custom_format(self, mock_popen, tmp_path):
+        """format: custom → pg_dump cmd contains -Fc and -Z0."""
+        outfile = tmp_path / "test.dump.gz"
+        ds = _ds(options={"format": "custom"})
+
+        mock_dump = MagicMock()
+        mock_dump.stdout = MagicMock()
+        mock_dump.stdout.close = MagicMock()
+        mock_dump.stderr = MagicMock()
+        mock_dump.stderr.read.return_value = b""
+        mock_dump.wait.return_value = 0
+        mock_dump.returncode = 0
+
+        mock_compress = MagicMock()
+        mock_compress.wait.return_value = 0
+
+        mock_popen.side_effect = [mock_dump, mock_compress]
+
+        PostgresEngine().dump(ds, str(outfile))
+
+        pg_dump_cmd = mock_popen.call_args_list[0][0][0]
+        assert "-Fc" in pg_dump_cmd
+        assert "-Z0" in pg_dump_cmd
+
+    # -- dump with zstd ---------------------------------------------------
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_dump_zstd(self, mock_popen, tmp_path):
+        """compression: zstd → compressor cmd is ["zstd", "-3", "-c"]."""
+        outfile = tmp_path / "test.sql.zst"
+        ds = _ds(options={"compression": "zstd"})
+
+        mock_dump = MagicMock()
+        mock_dump.stdout = MagicMock()
+        mock_dump.stdout.close = MagicMock()
+        mock_dump.stderr = MagicMock()
+        mock_dump.stderr.read.return_value = b""
+        mock_dump.wait.return_value = 0
+        mock_dump.returncode = 0
+
+        mock_compress = MagicMock()
+        mock_compress.wait.return_value = 0
+
+        mock_popen.side_effect = [mock_dump, mock_compress]
+
+        PostgresEngine().dump(ds, str(outfile))
+
+        compress_cmd = mock_popen.call_args_list[1][0][0]
+        assert compress_cmd == ["zstd", "-3", "-c"]
+
+    # -- dump with lz4 ----------------------------------------------------
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_dump_lz4(self, mock_popen, tmp_path):
+        """compression: lz4 → compressor cmd is ["lz4", "-1", "-c"]."""
+        outfile = tmp_path / "test.sql.lz4"
+        ds = _ds(options={"compression": "lz4"})
+
+        mock_dump = MagicMock()
+        mock_dump.stdout = MagicMock()
+        mock_dump.stdout.close = MagicMock()
+        mock_dump.stderr = MagicMock()
+        mock_dump.stderr.read.return_value = b""
+        mock_dump.wait.return_value = 0
+        mock_dump.returncode = 0
+
+        mock_compress = MagicMock()
+        mock_compress.wait.return_value = 0
+
+        mock_popen.side_effect = [mock_dump, mock_compress]
+
+        PostgresEngine().dump(ds, str(outfile))
+
+        compress_cmd = mock_popen.call_args_list[1][0][0]
+        assert compress_cmd == ["lz4", "-1", "-c"]
+
+    # -- dump with no compression -----------------------------------------
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_dump_no_compression(self, mock_popen, tmp_path):
+        """compression: none → only 1 Popen call (pg_dump stdout→file)."""
+        outfile = tmp_path / "test.sql"
+        ds = _ds(options={"compression": "none"})
+
+        mock_dump = MagicMock()
+        mock_dump.stderr = MagicMock()
+        mock_dump.stderr.read.return_value = b""
+        mock_dump.wait.return_value = 0
+        mock_dump.returncode = 0
+
+        mock_popen.side_effect = [mock_dump]
+
+        PostgresEngine().dump(ds, str(outfile))
+
+        assert mock_popen.call_count == 1
+
+    # -- dump with custom compression_level -------------------------------
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_dump_custom_compression_level(self, mock_popen, tmp_path):
+        """compression_level: 9 → gzip cmd is ["gzip", "-9"]."""
+        outfile = tmp_path / "test.sql.gz"
+        ds = _ds(options={"compression_level": 9})
+
+        mock_dump = MagicMock()
+        mock_dump.stdout = MagicMock()
+        mock_dump.stdout.close = MagicMock()
+        mock_dump.stderr = MagicMock()
+        mock_dump.stderr.read.return_value = b""
+        mock_dump.wait.return_value = 0
+        mock_dump.returncode = 0
+
+        mock_compress = MagicMock()
+        mock_compress.wait.return_value = 0
+
+        mock_popen.side_effect = [mock_dump, mock_compress]
+
+        PostgresEngine().dump(ds, str(outfile))
+
+        compress_cmd = mock_popen.call_args_list[1][0][0]
+        assert compress_cmd == ["gzip", "-9"]
+
+    # -- restore with custom format ---------------------------------------
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_restore_custom_format(self, mock_popen, tmp_path):
+        """Restoring a .dump.gz file → pg_restore with --no-owner --no-privileges."""
+        infile = tmp_path / "test.dump.gz"
+        infile.write_bytes(b"fake")
+
+        mock_decompress = MagicMock()
+        mock_decompress.stdout = MagicMock()
+        mock_decompress.stdout.close = MagicMock()
+        mock_decompress.wait.return_value = 0
+
+        mock_restore = MagicMock()
+        mock_restore.communicate.return_value = (b"", b"")
+        mock_restore.returncode = 0
+
+        mock_popen.side_effect = [mock_decompress, mock_restore]
+
+        PostgresEngine().restore(_ds(), str(infile))
+
+        restore_cmd = mock_popen.call_args_list[1][0][0]
+        assert "pg_restore" in restore_cmd[0]
+        assert "--no-owner" in restore_cmd
+        assert "--no-privileges" in restore_cmd
+
+    # -- restore with zstd ------------------------------------------------
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_restore_zstd(self, mock_popen, tmp_path):
+        """Restoring a .sql.zst file → decompressor is ["zstd", "-d", "-c"]."""
+        infile = tmp_path / "test.sql.zst"
+        infile.write_bytes(b"fake")
+
+        mock_decompress = MagicMock()
+        mock_decompress.stdout = MagicMock()
+        mock_decompress.stdout.close = MagicMock()
+        mock_decompress.wait.return_value = 0
+
+        mock_restore = MagicMock()
+        mock_restore.communicate.return_value = (b"", b"")
+        mock_restore.returncode = 0
+
+        mock_popen.side_effect = [mock_decompress, mock_restore]
+
+        PostgresEngine().restore(_ds(), str(infile))
+
+        decompress_cmd = mock_popen.call_args_list[0][0][0]
+        assert decompress_cmd == ["zstd", "-d", "-c"]
+
+    # -- restore with lz4 -------------------------------------------------
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_restore_lz4(self, mock_popen, tmp_path):
+        """Restoring a .sql.lz4 file → decompressor is ["lz4", "-d", "-c"]."""
+        infile = tmp_path / "test.sql.lz4"
+        infile.write_bytes(b"fake")
+
+        mock_decompress = MagicMock()
+        mock_decompress.stdout = MagicMock()
+        mock_decompress.stdout.close = MagicMock()
+        mock_decompress.wait.return_value = 0
+
+        mock_restore = MagicMock()
+        mock_restore.communicate.return_value = (b"", b"")
+        mock_restore.returncode = 0
+
+        mock_popen.side_effect = [mock_decompress, mock_restore]
+
+        PostgresEngine().restore(_ds(), str(infile))
+
+        decompress_cmd = mock_popen.call_args_list[0][0][0]
+        assert decompress_cmd == ["lz4", "-d", "-c"]
+
+    # -- restore with no compression --------------------------------------
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_restore_no_compression(self, mock_popen, tmp_path):
+        """Restoring a .sql file → only 1 Popen call (file→psql)."""
+        infile = tmp_path / "test.sql"
+        infile.write_bytes(b"fake")
+
+        mock_restore = MagicMock()
+        mock_restore.communicate.return_value = (b"", b"")
+        mock_restore.returncode = 0
+
+        mock_popen.side_effect = [mock_restore]
+
+        PostgresEngine().restore(_ds(), str(infile))
+
+        assert mock_popen.call_count == 1
+
+    # -- restore detects from extension -----------------------------------
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_restore_detects_from_extension(self, mock_popen, tmp_path):
+        """Restore a .dump.zst file while ds.options say gzip;
+        verify zstd decompressor + pg_restore used."""
+        infile = tmp_path / "test.dump.zst"
+        infile.write_bytes(b"fake")
+
+        # ds options say gzip, but file extension is .dump.zst
+        ds = _ds(options={"compression": "gzip", "format": "plain"})
+
+        mock_decompress = MagicMock()
+        mock_decompress.stdout = MagicMock()
+        mock_decompress.stdout.close = MagicMock()
+        mock_decompress.wait.return_value = 0
+
+        mock_restore = MagicMock()
+        mock_restore.communicate.return_value = (b"", b"")
+        mock_restore.returncode = 0
+
+        mock_popen.side_effect = [mock_decompress, mock_restore]
+
+        PostgresEngine().restore(ds, str(infile))
+
+        # Should detect zstd from extension, not gzip from ds.options
+        decompress_cmd = mock_popen.call_args_list[0][0][0]
+        assert decompress_cmd == ["zstd", "-d", "-c"]
+
+        # Should detect custom format from extension, not plain from ds.options
+        restore_cmd = mock_popen.call_args_list[1][0][0]
+        assert "pg_restore" in restore_cmd[0]
+
+    # -- _detect_from_extension -------------------------------------------
+
+    @pytest.mark.parametrize("filename,expected_fmt,expected_comp", [
+        ("db-20260101-120000.sql.gz",  "plain",  "gzip"),
+        ("db-20260101-120000.sql.zst", "plain",  "zstd"),
+        ("db-20260101-120000.sql.lz4", "plain",  "lz4"),
+        ("db-20260101-120000.sql",     "plain",  "none"),
+        ("db-20260101-120000.dump.gz", "custom", "gzip"),
+        ("db-20260101-120000.dump.zst","custom", "zstd"),
+        ("db-20260101-120000.dump.lz4","custom", "lz4"),
+        ("db-20260101-120000.dump",    "custom", "none"),
+    ])
+    def test_detect_from_extension(self, filename, expected_fmt, expected_comp):
+        fmt, comp = _detect_from_extension(filename)
+        assert fmt == expected_fmt
+        assert comp == expected_comp
+
+    def test_detect_from_extension_unknown_raises(self):
+        with pytest.raises(ValueError, match="Unrecognized backup file extension"):
+            _detect_from_extension("backup.tar.gz")
 
 
 class TestCreateEngineEdgeCases:

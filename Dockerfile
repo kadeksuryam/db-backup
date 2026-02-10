@@ -14,7 +14,7 @@ RUN apt-get update && \
     for v in $PG_VERSIONS; do \
       apt-get install -y --no-install-recommends postgresql-client-$v; \
     done && \
-    apt-get install -y --no-install-recommends openssh-client && \
+    apt-get install -y --no-install-recommends openssh-client zstd lz4 && \
     apt-get purge -y curl gnupg lsb-release && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*

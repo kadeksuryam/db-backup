@@ -1,8 +1,8 @@
-"""Tests for stores.parse_timestamp."""
+"""Tests for stores.parse_timestamp and is_backup_file."""
 
 from datetime import datetime, timezone
 
-from stores import parse_timestamp
+from stores import parse_timestamp, is_backup_file
 
 
 def test_standard_filename():
@@ -74,3 +74,60 @@ def test_leap_year_feb29():
 def test_non_leap_year_feb29():
     """Feb 29 in a non-leap year → invalid date → None."""
     assert parse_timestamp("db-20250229-120000.sql.gz") is None
+
+
+# -- New extension tests --------------------------------------------------
+
+def test_sql_zst_extension():
+    ts = parse_timestamp("db-20260101-120000.sql.zst")
+    assert ts == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_sql_lz4_extension():
+    ts = parse_timestamp("db-20260101-120000.sql.lz4")
+    assert ts == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_dump_gz_extension():
+    ts = parse_timestamp("db-20260101-120000.dump.gz")
+    assert ts == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_dump_zst_extension():
+    ts = parse_timestamp("db-20260101-120000.dump.zst")
+    assert ts == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_dump_lz4_extension():
+    ts = parse_timestamp("db-20260101-120000.dump.lz4")
+    assert ts == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_plain_sql_extension():
+    ts = parse_timestamp("db-20260101-120000.sql")
+    assert ts == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_plain_dump_extension():
+    ts = parse_timestamp("db-20260101-120000.dump")
+    assert ts == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+# -- is_backup_file tests ------------------------------------------------
+
+def test_is_backup_file_recognized():
+    assert is_backup_file("db-20260101-120000.sql.gz")
+    assert is_backup_file("db-20260101-120000.sql.zst")
+    assert is_backup_file("db-20260101-120000.sql.lz4")
+    assert is_backup_file("db-20260101-120000.sql")
+    assert is_backup_file("db-20260101-120000.dump.gz")
+    assert is_backup_file("db-20260101-120000.dump.zst")
+    assert is_backup_file("db-20260101-120000.dump.lz4")
+    assert is_backup_file("db-20260101-120000.dump")
+
+
+def test_is_backup_file_unrecognized():
+    assert not is_backup_file("readme.txt")
+    assert not is_backup_file("backup.tar.gz")
+    assert not is_backup_file("data.csv")
+    assert not is_backup_file("")

@@ -8,6 +8,20 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 
+# All recognized backup file extensions, compound extensions first so
+# they are matched before their shorter suffixes.
+BACKUP_EXTENSIONS = [
+    ".sql.gz", ".sql.zst", ".sql.lz4",
+    ".dump.gz", ".dump.zst", ".dump.lz4",
+    ".sql", ".dump",
+]
+
+
+def is_backup_file(filename: str) -> bool:
+    """Return True if *filename* ends with a recognized backup extension."""
+    return any(filename.endswith(ext) for ext in BACKUP_EXTENSIONS)
+
+
 @dataclass
 class BackupInfo:
     """Metadata for a single backup file in a store."""
@@ -20,7 +34,11 @@ class BackupInfo:
 
 def parse_timestamp(filename: str) -> datetime | None:
     """Parse YYYYMMDD-HHMMSS from a backup filename like 'mydb-20260210-143000.sql.gz'."""
-    name = filename.removesuffix(".sql.gz")
+    name = filename
+    for ext in BACKUP_EXTENSIONS:
+        if filename.endswith(ext):
+            name = filename.removesuffix(ext)
+            break
     parts = name.rsplit("-", 2)
     if len(parts) < 3:
         return None

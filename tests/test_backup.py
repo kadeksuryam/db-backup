@@ -47,6 +47,9 @@ class TestRunBackup:
         mock_engine.dump.assert_called_once()
         mock_store.upload.assert_called_once()
 
+        # Verify file_extension called with ds arg
+        mock_engine.file_extension.assert_called_once_with(ds)
+
         # Verify the remote key structure
         assert key.startswith("prod/testdb/")
         assert key.endswith(".sql.gz")
@@ -176,3 +179,22 @@ class TestRunBackup:
 
         # tempfile.TemporaryDirectory() handles cleanup via context manager
         # Just verify the error propagated (cleanup is guaranteed by Python)
+
+    @patch("backup.create_engine")
+    def test_custom_extension_in_filename(self, mock_create_engine):
+        """file_extension returning .dump.zst → filename uses that extension."""
+        mock_engine = MagicMock()
+        mock_engine.file_extension.return_value = ".dump.zst"
+
+        def fake_dump(ds, output_path):
+            with open(output_path, "wb") as f:
+                f.write(b"data")
+
+        mock_engine.dump.side_effect = fake_dump
+        mock_create_engine.return_value = mock_engine
+
+        mock_store = MagicMock()
+        key = run_backup(_ds(), mock_store, "prod")
+
+        assert key.endswith(".dump.zst")
+        mock_engine.file_extension.assert_called_once()

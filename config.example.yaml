@@ -21,6 +21,9 @@ datasources:
     password_env: APPDB_PASSWORD      # reads $APPDB_PASSWORD
     database: appdb
     pg_version: 17                    # uses /usr/lib/postgresql/17/bin/pg_dump
+    # format: plain                   # plain (SQL text, default) or custom (pg_dump -Fc binary)
+    # compression: gzip               # gzip (default), zstd, lz4, or none
+    # compression_level: 6            # compressor-specific level (gzip=6, zstd=3, lz4=1)
 
   analyticsdb:
     engine: postgres
@@ -30,6 +33,18 @@ datasources:
     password_env: ANALYTICS_PASSWORD
     database: analytics
     pg_version: 14                    # uses /usr/lib/postgresql/14/bin/pg_dump
+
+  # Example: binary format with zstd compression (fast, good ratio)
+  warehousedb:
+    engine: postgres
+    host: warehouse-db.internal
+    port: 5432
+    user: warehouse
+    password_env: WAREHOUSE_PASSWORD
+    database: warehouse
+    format: custom                    # pg_dump -Fc binary format
+    compression: zstd                 # zstd compression (requires zstd in image)
+    compression_level: 5              # zstd level (default: 3)
 
 stores:
   # S3-compatible storage (Cloudflare R2, AWS S3, MinIO, etc.)

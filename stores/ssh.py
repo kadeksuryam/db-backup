@@ -7,7 +7,7 @@ import os
 import shlex
 import subprocess
 
-from . import BackupInfo, Store, parse_timestamp
+from . import BACKUP_EXTENSIONS, BackupInfo, Store, parse_timestamp
 
 log = logging.getLogger(__name__)
 
@@ -79,9 +79,13 @@ class SSHStore(Store):
 
         # POSIX-portable: find files then get size with wc -c
         quoted_dir = shlex.quote(remote_dir)
+        # Build find expression matching all recognized backup extensions
+        name_clauses = " -o ".join(
+            f"-name '*{ext}'" for ext in BACKUP_EXTENSIONS
+        )
         cmd = [
             "ssh", *self._ssh_opts(), self._ssh_dest(),
-            f"find {quoted_dir} -name '*.sql.gz' -type f 2>/dev/null "
+            f"find {quoted_dir} \\( {name_clauses} \\) -type f 2>/dev/null "
             f"| while IFS= read -r f; do "
             f"size=$(wc -c < \"$f\"); "
             f"echo \"$f\\t$size\"; "

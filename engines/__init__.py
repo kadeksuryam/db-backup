@@ -36,8 +36,8 @@ class Engine(ABC):
         """Drop and recreate the target database."""
 
     @abstractmethod
-    def file_extension(self) -> str:
-        """Return the backup file extension (e.g. '.sql.gz')."""
+    def file_extension(self, ds: Datasource) -> str:
+        """Return the backup file extension based on datasource options (e.g. '.sql.gz')."""
 
 
 # Map of engine type names to module names within this package.

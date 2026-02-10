@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-from stores import create_store, BackupInfo
+from stores import create_store, BackupInfo, BACKUP_EXTENSIONS
 from stores.s3 import S3Store
 from stores.ssh import SSHStore
 
@@ -156,6 +156,49 @@ class TestS3Store:
             Bucket="mybucket", Key="prefix/file.sql.gz"
         )
 
+    @patch("stores.s3.boto3")
+    def test_list_mixed_extensions(self, mock_boto):
+        """S3 list recognizes all supported backup extensions."""
+        mock_client = MagicMock()
+        mock_boto.session.Session.return_value.client.return_value = mock_client
+
+        paginator = MagicMock()
+        mock_client.get_paginator.return_value = paginator
+        paginator.paginate.return_value = [
+            {"Contents": [
+                {"Key": "prod/db/db-20260101-120000.sql.gz", "Size": 1024},
+                {"Key": "prod/db/db-20260102-120000.sql.zst", "Size": 2048},
+                {"Key": "prod/db/db-20260103-120000.dump.lz4", "Size": 512},
+                {"Key": "prod/db/db-20260104-120000.dump", "Size": 4096},
+                {"Key": "prod/db/db-20260105-120000.sql", "Size": 8192},
+            ]},
+        ]
+
+        store = S3Store(bucket="mybucket")
+        backups = store.list("prod/db")
+        assert len(backups) == 5
+        assert backups[0].timestamp < backups[-1].timestamp
+
+    @patch("stores.s3.boto3")
+    def test_list_skips_unknown_extensions(self, mock_boto):
+        """S3 list skips files with unrecognized extensions like .tar.gz."""
+        mock_client = MagicMock()
+        mock_boto.session.Session.return_value.client.return_value = mock_client
+
+        paginator = MagicMock()
+        mock_client.get_paginator.return_value = paginator
+        paginator.paginate.return_value = [
+            {"Contents": [
+                {"Key": "prod/db/db-20260101-120000.tar.gz", "Size": 1024},
+                {"Key": "prod/db/db-20260102-120000.sql.gz", "Size": 2048},
+            ]},
+        ]
+
+        store = S3Store(bucket="mybucket")
+        backups = store.list("prod/db")
+        assert len(backups) == 1
+        assert backups[0].filename == "db-20260102-120000.sql.gz"
+
 
 class TestSSHStore:
     def _store(self):
@@ -290,6 +333,31 @@ class TestSSHStore:
         store = SSHStore(host="h", user="u", path="/p")
         opts = store._ssh_opts()
         assert "-i" not in opts
+
+    @patch("stores.ssh.subprocess.run")
+    def test_list_mixed_extensions(self, mock_run):
+        """SSH list parses mixed backup extensions."""
+        output = (
+            "/data/backups/prod/db/db-20260101-120000.sql.gz\t1024\n"
+            "/data/backups/prod/db/db-20260102-120000.dump.zst\t2048\n"
+            "/data/backups/prod/db/db-20260103-120000.sql.lz4\t512\n"
+        )
+        mock_run.return_value = MagicMock(returncode=0, stdout=output)
+        store = self._store()
+        backups = store.list("prod/db")
+        assert len(backups) == 3
+
+    @patch("stores.ssh.subprocess.run")
+    def test_list_find_includes_all_extensions(self, mock_run):
+        """SSH find command includes patterns for all backup extensions."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="")
+        store = self._store()
+        store.list("prod/db")
+
+        cmd = mock_run.call_args[0][0]
+        ssh_cmd_str = cmd[-1]
+        for ext in BACKUP_EXTENSIONS:
+            assert f"'*{ext}'" in ssh_cmd_str
 
 
 class TestCreateStoreEdgeCases:

@@ -71,6 +71,41 @@ datasources:
     pg_version: 17                  # optional: use versioned pg_dump binary
 ```
 
+#### Dump Format & Compression
+
+Each datasource supports optional `format`, `compression`, and `compression_level` options:
+
+| Option | Values | Default | Description |
+|--------|--------|---------|-------------|
+| `format` | `plain`, `custom` | `plain` | `plain` = SQL text (restored with `psql`); `custom` = binary (restored with `pg_restore`) |
+| `compression` | `gzip`, `zstd`, `lz4`, `none` | `gzip` | External compressor piped after `pg_dump` |
+| `compression_level` | integer | tool default | Passed as level flag to the compressor (gzip=6, zstd=3, lz4=1) |
+
+Backup file extensions reflect the chosen format and compression:
+
+| format \ compression | gzip | zstd | lz4 | none |
+|---|---|---|---|---|
+| **plain** | `.sql.gz` | `.sql.zst` | `.sql.lz4` | `.sql` |
+| **custom** | `.dump.gz` | `.dump.zst` | `.dump.lz4` | `.dump` |
+
+Example using binary format with zstd compression:
+
+```yaml
+datasources:
+  warehousedb:
+    engine: postgres
+    host: warehouse-db.internal
+    port: 5432
+    user: warehouse
+    password_env: WAREHOUSE_PASSWORD
+    database: warehouse
+    format: custom
+    compression: zstd
+    compression_level: 5
+```
+
+Restore automatically detects the format and compression from the file extension, so backups made with any combination can be restored regardless of the current datasource settings.
+
 ### Stores
 
 Define backup storage destinations:

@@ -26,7 +26,7 @@ def run_backup(ds: Datasource, store: Store, prefix: str) -> str:
     engine.check_version_compat(ds)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    filename = f"{ds.database}-{timestamp}{engine.file_extension()}"
+    filename = f"{ds.database}-{timestamp}{engine.file_extension(ds)}"
     remote_key = f"{build_prefix(prefix, ds.database)}/{filename}"
 
     with tempfile.TemporaryDirectory() as tmpdir:

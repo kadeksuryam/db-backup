@@ -1,0 +1,32 @@
+# Version control
+.git/
+.gitignore
+
+# Tests and development
+tests/
+.pytest_cache/
+__pycache__/
+.venv/
+
+# Documentation and markdown
+*.md
+
+# Config files (may contain credentials or are just examples)
+config.yaml
+config.yml
+config.example.yaml
+*.env
+
+# IDE / editor
+.cursor/
+.vscode/
+.idea/
+
+# Docker (avoid recursive inclusion)
+Dockerfile
+.dockerignore
+
+# Python artifacts
+*.pyc
+*.pyo
+.python-version

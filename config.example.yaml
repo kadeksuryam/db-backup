@@ -75,7 +75,9 @@ notifications:
     username_env: SMTP_USER           # reads $SMTP_USER
     password_env: SMTP_PASS           # reads $SMTP_PASS
     from: backups@example.com
-    to: ops@example.com
+    to:                               # single address or list of addresses
+      - ops@example.com
+      - dev-team@example.com
     use_tls: true
 
 jobs:

@@ -125,8 +125,17 @@ class PostgresEngine(Engine):
 
     @staticmethod
     def _pg_env(ds: Datasource) -> dict[str, str]:
-        """Build environment dict for PostgreSQL CLI tools."""
-        env = os.environ.copy()
+        """Build a minimal environment dict for PostgreSQL CLI tools.
+
+        Only passes through PATH and essential locale variables to avoid
+        leaking unrelated secrets from the parent environment.
+        """
+        env: dict[str, str] = {}
+        # Pass through only the essentials the child process needs
+        for key in ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ"):
+            val = os.environ.get(key)
+            if val is not None:
+                env[key] = val
         env["PGHOST"] = ds.host
         env["PGPORT"] = str(ds.port)
         env["PGUSER"] = ds.user

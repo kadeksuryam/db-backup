@@ -4,9 +4,20 @@ from __future__ import annotations
 
 import smtplib
 from email.mime.text import MIMEText
+from typing import List, Union
 
 from config import ConfigError
 from notifiers import Notifier
+
+
+def _normalize_recipients(value: Union[str, List[str]]) -> List[str]:
+    """Normalize a recipient value to a list of addresses.
+
+    Accepts a single address string, a comma-separated string, or a list.
+    """
+    if isinstance(value, list):
+        return [addr.strip() for addr in value if addr.strip()]
+    return [addr.strip() for addr in value.split(",") if addr.strip()]
 
 
 class EmailNotifier(Notifier):
@@ -19,7 +30,7 @@ class EmailNotifier(Notifier):
         username: str = "",
         password: str = "",
         from_addr: str = "",
-        to_addr: str = "",
+        to_addrs: Union[str, List[str]] = "",
         use_tls: bool = True,
         subject_prefix: str = "[dbbackup]",
         timeout: float = 30.0,
@@ -29,24 +40,26 @@ class EmailNotifier(Notifier):
         self.username = username
         self.password = password
         self.from_addr = from_addr
-        self.to_addr = to_addr
+        self.to_addrs = _normalize_recipients(to_addrs) if to_addrs else []
         self.use_tls = use_tls
         self.subject_prefix = subject_prefix
         self.timeout = timeout
 
     def send(self, job_name: str, status: str, message: str) -> None:
+        if not self.to_addrs:
+            raise ConfigError("Email notifier has no recipients configured ('to' is empty)")
         subject = f"{self.subject_prefix} {job_name}: {status.upper()}"
         msg = MIMEText(message)
         msg["Subject"] = subject
         msg["From"] = self.from_addr
-        msg["To"] = self.to_addr
+        msg["To"] = ", ".join(self.to_addrs)
 
         with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=self.timeout) as server:
             if self.use_tls:
                 server.starttls()
             if self.username:
                 server.login(self.username, self.password)
-            server.sendmail(self.from_addr, [self.to_addr], msg.as_string())
+            server.sendmail(self.from_addr, self.to_addrs, msg.as_string())
 
 
 def create(config: dict) -> EmailNotifier:
@@ -59,7 +72,7 @@ def create(config: dict) -> EmailNotifier:
         username=config.get("username", ""),
         password=config.get("password", ""),
         from_addr=config.get("from", ""),
-        to_addr=config.get("to", ""),
+        to_addrs=config.get("to", ""),
         use_tls=config.get("use_tls", True),
         subject_prefix=config.get("subject_prefix", "[dbbackup]"),
         timeout=float(config.get("timeout", 30)),

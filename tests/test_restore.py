@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from config import Datasource
-from restore import list_backups, run_restore
+from restore import RestoreAborted, RestoreError, list_backups, run_restore
 from stores import BackupInfo
 
 
@@ -41,6 +41,27 @@ class TestListBackups:
         assert "2026-01-01 12:00:00" in out
         assert "2.0 KB" in out
         assert "Total: 1 backup(s)" in out
+
+    def test_returns_backup_list(self):
+        """list_backups returns the BackupInfo list for programmatic use."""
+        store = MagicMock()
+        backups = [
+            _bi("prod/testdb/db-20260101-120000.sql.gz",
+                 datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc), size=2048),
+            _bi("prod/testdb/db-20260102-120000.sql.gz",
+                 datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc), size=4096),
+        ]
+        store.list.return_value = backups
+        result = list_backups(store, "prod", "testdb")
+        assert result == backups
+        assert len(result) == 2
+
+    def test_returns_empty_list_when_no_backups(self):
+        """list_backups returns [] when no backups exist."""
+        store = MagicMock()
+        store.list.return_value = []
+        result = list_backups(store, "prod", "testdb")
+        assert result == []
 
     def test_no_backups(self, capsys):
         store = MagicMock()
@@ -128,22 +149,22 @@ class TestRunRestore:
         assert "20260101" in downloaded_key
 
     @patch("restore.create_engine")
-    def test_no_backups_exits(self, mock_create_engine):
+    def test_no_backups_raises(self, mock_create_engine):
         mock_create_engine.return_value = MagicMock()
         store = MagicMock()
         store.list.return_value = []
-        with pytest.raises(SystemExit):
+        with pytest.raises(RestoreError, match="No backups found"):
             run_restore(_ds(), store, "prod")
 
     @patch("restore.create_engine")
-    def test_filename_not_found_exits(self, mock_create_engine):
+    def test_filename_not_found_raises(self, mock_create_engine):
         mock_create_engine.return_value = MagicMock()
         store = MagicMock()
         store.list.return_value = [
             _bi("prod/testdb/db-20260101-120000.sql.gz",
                  datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)),
         ]
-        with pytest.raises(SystemExit):
+        with pytest.raises(RestoreError, match="not found"):
             run_restore(_ds(), store, "prod", filename="nonexistent.sql.gz")
 
     @patch("restore.create_engine")
@@ -170,8 +191,8 @@ class TestRunRestore:
 
     @patch("restore.create_engine")
     @patch("builtins.input", return_value="n")
-    def test_existing_tables_user_declines_exits(self, mock_input, mock_create_engine):
-        """With tables and user says no, exits."""
+    def test_existing_tables_user_declines_raises(self, mock_input, mock_create_engine):
+        """With tables and user says no, raises RestoreAborted."""
         mock_engine = MagicMock()
         mock_engine.count_tables.return_value = 5
         mock_create_engine.return_value = mock_engine
@@ -186,7 +207,7 @@ class TestRunRestore:
                 f.write(b"data")
         store.download.side_effect = fake_download
 
-        with pytest.raises(SystemExit):
+        with pytest.raises(RestoreAborted, match="aborted"):
             run_restore(_ds(), store, "prod")
 
         mock_engine.drop_and_recreate.assert_not_called()
@@ -354,8 +375,8 @@ class TestRunRestoreEdgeCases:
 
     @patch("restore.create_engine")
     @patch("builtins.input", return_value="nah")
-    def test_user_input_other_text_exits(self, mock_input, mock_create_engine):
-        """Any text besides 'y'/'yes' → exits."""
+    def test_user_input_other_text_raises(self, mock_input, mock_create_engine):
+        """Any text besides 'y'/'yes' → RestoreAborted."""
         mock_engine = MagicMock()
         mock_engine.count_tables.return_value = 5
         mock_create_engine.return_value = mock_engine
@@ -370,7 +391,7 @@ class TestRunRestoreEdgeCases:
                 f.write(b"data")
         store.download.side_effect = fake_download
 
-        with pytest.raises(SystemExit):
+        with pytest.raises(RestoreAborted):
             run_restore(_ds(), store, "prod")
 
     @patch("restore.create_engine")
@@ -397,8 +418,8 @@ class TestRunRestoreEdgeCases:
 
     @patch("restore.create_engine")
     @patch("builtins.input", return_value="")
-    def test_user_input_empty_exits(self, mock_input, mock_create_engine):
-        """Empty input → should exit (not in 'y', 'yes')."""
+    def test_user_input_empty_raises(self, mock_input, mock_create_engine):
+        """Empty input → RestoreAborted (not in 'y', 'yes')."""
         mock_engine = MagicMock()
         mock_engine.count_tables.return_value = 5
         mock_create_engine.return_value = mock_engine
@@ -413,7 +434,7 @@ class TestRunRestoreEdgeCases:
                 f.write(b"data")
         store.download.side_effect = fake_download
 
-        with pytest.raises(SystemExit):
+        with pytest.raises(RestoreAborted):
             run_restore(_ds(), store, "prod")
 
     @patch("restore.create_engine")

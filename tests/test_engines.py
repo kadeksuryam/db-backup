@@ -72,6 +72,15 @@ class TestPostgresEngine:
         assert env["PGPASSWORD"] == "testpass"
         assert env["PGDATABASE"] == "testdb"
 
+    def test_pg_env_is_minimal(self, monkeypatch):
+        """Env only contains PG vars and essential system vars, not arbitrary parent vars."""
+        monkeypatch.setenv("UNRELATED_SECRET", "should_not_leak")
+        monkeypatch.setenv("PATH", "/usr/bin")
+        ds = _ds()
+        env = PostgresEngine._pg_env(ds)
+        assert "UNRELATED_SECRET" not in env
+        assert env.get("PATH") == "/usr/bin"
+
     # -- check_connectivity -----------------------------------------------
 
     @patch("engines.postgres.subprocess.run")

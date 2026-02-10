@@ -733,3 +733,112 @@ class TestNotifications:
 
         _run_single_job("job1", raw, prune=False)
         mock_create_notifier.assert_not_called()
+
+
+class TestMainExceptionHandling:
+    """Verify CLI exit codes for RestoreError and RestoreAborted."""
+
+    @patch("dbbackup.config.load")
+    @patch("dbbackup.cmd_restore")
+    def test_restore_error_exits_1(self, mock_cmd_restore, mock_load, tmp_path, capsys):
+        """RestoreError from restore command → exit code 1, message on stderr."""
+        from restore import RestoreError
+        mock_load.return_value = {}
+        mock_cmd_restore.side_effect = RestoreError("No backups found under 'prod/testdb'")
+
+        with patch("sys.argv", ["dbbackup", "restore", "job1"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1
+        assert "No backups found" in capsys.readouterr().err
+
+    @patch("dbbackup.config.load")
+    @patch("dbbackup.cmd_restore")
+    def test_restore_aborted_exits_0(self, mock_cmd_restore, mock_load, tmp_path, capsys):
+        """RestoreAborted from restore command → exit code 0, message on stdout."""
+        from restore import RestoreAborted
+        mock_load.return_value = {}
+        mock_cmd_restore.side_effect = RestoreAborted("Restore aborted by user.")
+
+        with patch("sys.argv", ["dbbackup", "restore", "job1"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 0
+        assert "aborted" in capsys.readouterr().out
+
+    @patch("dbbackup.config.load")
+    def test_config_error_exits_1(self, mock_load, capsys):
+        """ConfigError → exit code 1, message on stderr."""
+        mock_load.side_effect = ConfigError("config file not found")
+
+        with patch("sys.argv", ["dbbackup", "backup", "--all"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1
+        assert "config file not found" in capsys.readouterr().err
+
+
+class TestCmdBackupSummaryLogging:
+    """Verify summary logging for multi-job backup runs."""
+
+    @patch("dbbackup.create_store")
+    @patch("dbbackup.run_backup")
+    def test_summary_logged_for_multiple_jobs(self, mock_run_backup, mock_create_store, tmp_path, caplog):
+        """Running multiple jobs logs a summary with counts and timing."""
+        import logging
+        cfg_path = _write_config(tmp_path)
+        raw = config.load(cfg_path)
+
+        args = argparse.Namespace(all=True, job=None, prune=False)
+        mock_create_store.return_value = MagicMock()
+
+        with caplog.at_level(logging.INFO, logger="dbbackup"):
+            cmd_backup(args, raw)
+
+        summary_msgs = [r.message for r in caplog.records if "Summary" in r.message]
+        assert len(summary_msgs) == 1
+        assert "2 succeeded" in summary_msgs[0]
+        assert "0 failed" in summary_msgs[0]
+
+    @patch("dbbackup.create_store")
+    @patch("dbbackup.run_backup")
+    def test_summary_shows_failures(self, mock_run_backup, mock_create_store, tmp_path, caplog):
+        """Summary correctly reports failed jobs."""
+        import logging
+        cfg_path = _write_config(tmp_path)
+        raw = config.load(cfg_path)
+
+        call_count = [0]
+        def side_effect(*a, **kw):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("boom")
+        mock_run_backup.side_effect = side_effect
+        mock_create_store.return_value = MagicMock()
+
+        args = argparse.Namespace(all=True, job=None, prune=False)
+        with caplog.at_level(logging.INFO, logger="dbbackup"):
+            with pytest.raises(SystemExit):
+                cmd_backup(args, raw)
+
+        summary_msgs = [r.message for r in caplog.records if "Summary" in r.message]
+        assert len(summary_msgs) == 1
+        assert "1 succeeded" in summary_msgs[0]
+        assert "1 failed" in summary_msgs[0]
+
+    @patch("dbbackup.create_store")
+    @patch("dbbackup.run_backup")
+    def test_no_summary_for_single_job(self, mock_run_backup, mock_create_store, tmp_path, caplog):
+        """Single-job run does NOT produce a summary."""
+        import logging
+        cfg_path = _write_config(tmp_path)
+        raw = config.load(cfg_path)
+
+        args = argparse.Namespace(all=False, job="job1", prune=False)
+        mock_create_store.return_value = MagicMock()
+
+        with caplog.at_level(logging.INFO, logger="dbbackup"):
+            cmd_backup(args, raw)
+
+        summary_msgs = [r.message for r in caplog.records if "Summary" in r.message]
+        assert len(summary_msgs) == 0

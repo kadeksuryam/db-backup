@@ -21,7 +21,7 @@ import config
 from config import ConfigError
 from backup import run_backup
 from notifiers import create_notifier
-from restore import list_backups, run_restore
+from restore import RestoreAborted, RestoreError, list_backups, run_restore
 from retention import apply_retention
 from stores import create_store
 
@@ -100,27 +100,48 @@ def cmd_backup(args: argparse.Namespace, raw_config: dict) -> None:
     parallel = getattr(args, "parallel", 1)
     dry_run = getattr(args, "dry_run", False)
     failed = []
+    succeeded = []
+    total_start = time.monotonic()
 
     if parallel <= 1:
         for name in job_names:
+            job_start = time.monotonic()
             try:
                 _run_single_job(name, raw_config, args.prune, dry_run=dry_run)
+                succeeded.append((name, time.monotonic() - job_start))
             except Exception as e:
                 log.error("Job '%s' failed: %s", name, e)
                 failed.append(name)
     else:
+        job_starts: dict[str, float] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
-            future_to_name = {
-                executor.submit(_run_single_job, name, raw_config, args.prune, dry_run=dry_run): name
-                for name in job_names
-            }
+            future_to_name = {}
+            for name in job_names:
+                job_starts[name] = time.monotonic()
+                future_to_name[
+                    executor.submit(_run_single_job, name, raw_config, args.prune, dry_run=dry_run)
+                ] = name
             for future in concurrent.futures.as_completed(future_to_name):
                 name = future_to_name[future]
+                elapsed = time.monotonic() - job_starts[name]
                 try:
                     future.result()
+                    succeeded.append((name, elapsed))
                 except Exception as e:
                     log.error("Job '%s' failed: %s", name, e)
                     failed.append(name)
+
+    # Summary (always log when running multiple jobs)
+    total_elapsed = time.monotonic() - total_start
+    if len(job_names) > 1:
+        log.info(
+            "=== Summary: %d succeeded, %d failed, total time %.1fs ===",
+            len(succeeded), len(failed), total_elapsed,
+        )
+        for name, elapsed in succeeded:
+            log.info("  OK   %s (%.1fs)", name, elapsed)
+        for name in failed:
+            log.info("  FAIL %s", name)
 
     if failed:
         log.error("Failed jobs: %s", ", ".join(failed))
@@ -209,7 +230,10 @@ def main() -> None:
             "restore": cmd_restore,
         }
         commands[args.command](args, raw_config)
-    except ConfigError as e:
+    except RestoreAborted as e:
+        print(str(e))
+        sys.exit(0)
+    except (ConfigError, RestoreError) as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
 

@@ -22,20 +22,18 @@ class TestNotifierFactory:
             create_notifier({"type": "slack"})
 
 
-class TestEmailNotifierFactory:
-    def test_email_missing_smtp_host_raises_config_error(self):
-        """email create() without 'smtp_host' → ConfigError."""
-        from notifiers.email import create
-        with pytest.raises(ConfigError, match="smtp_host"):
-            create({"smtp_port": 587, "from": "a@b.com"})
-
-
 class TestEmailNotifier:
-    @patch("notifiers.email.smtplib.SMTP")
-    def test_email_send_success(self, mock_smtp_class):
+    @staticmethod
+    def _mock_smtp_server(mock_smtp_class):
+        """Configure the SMTP mock and return the mock server instance."""
         mock_server = MagicMock()
         mock_smtp_class.return_value.__enter__ = MagicMock(return_value=mock_server)
         mock_smtp_class.return_value.__exit__ = MagicMock(return_value=False)
+        return mock_server
+
+    @patch("notifiers.email.smtplib.SMTP")
+    def test_email_send_success(self, mock_smtp_class):
+        mock_server = self._mock_smtp_server(mock_smtp_class)
 
         notifier = EmailNotifier(
             smtp_host="smtp.test",
@@ -43,7 +41,7 @@ class TestEmailNotifier:
             username="user",
             password="pass",
             from_addr="from@test.com",
-            to_addr="to@test.com",
+            to_addrs="to@test.com",
             use_tls=True,
         )
         notifier.send("myjob", "success", "Backup done")
@@ -56,16 +54,48 @@ class TestEmailNotifier:
         assert args[1] == ["to@test.com"]
 
     @patch("notifiers.email.smtplib.SMTP")
+    def test_email_send_multiple_recipients_list(self, mock_smtp_class):
+        """Multiple recipients passed as a list."""
+        mock_server = self._mock_smtp_server(mock_smtp_class)
+
+        notifier = EmailNotifier(
+            smtp_host="smtp.test",
+            from_addr="from@test.com",
+            to_addrs=["alice@test.com", "bob@test.com", "carol@test.com"],
+        )
+        notifier.send("myjob", "success", "Backup done")
+
+        args = mock_server.sendmail.call_args[0]
+        assert args[0] == "from@test.com"
+        assert args[1] == ["alice@test.com", "bob@test.com", "carol@test.com"]
+        # To header should be a comma-separated string
+        sent_msg = args[2]
+        assert "alice@test.com, bob@test.com, carol@test.com" in sent_msg
+
+    @patch("notifiers.email.smtplib.SMTP")
+    def test_email_send_multiple_recipients_comma_string(self, mock_smtp_class):
+        """Multiple recipients passed as a comma-separated string."""
+        mock_server = self._mock_smtp_server(mock_smtp_class)
+
+        notifier = EmailNotifier(
+            smtp_host="smtp.test",
+            from_addr="from@test.com",
+            to_addrs="alice@test.com, bob@test.com",
+        )
+        notifier.send("myjob", "success", "Backup done")
+
+        args = mock_server.sendmail.call_args[0]
+        assert args[1] == ["alice@test.com", "bob@test.com"]
+
+    @patch("notifiers.email.smtplib.SMTP")
     def test_email_send_no_tls(self, mock_smtp_class):
-        mock_server = MagicMock()
-        mock_smtp_class.return_value.__enter__ = MagicMock(return_value=mock_server)
-        mock_smtp_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_server = self._mock_smtp_server(mock_smtp_class)
 
         notifier = EmailNotifier(
             smtp_host="smtp.test",
             use_tls=False,
             from_addr="a@b.com",
-            to_addr="c@d.com",
+            to_addrs="c@d.com",
         )
         notifier.send("job1", "failure", "Error")
 
@@ -73,15 +103,13 @@ class TestEmailNotifier:
 
     @patch("notifiers.email.smtplib.SMTP")
     def test_email_send_no_auth(self, mock_smtp_class):
-        mock_server = MagicMock()
-        mock_smtp_class.return_value.__enter__ = MagicMock(return_value=mock_server)
-        mock_smtp_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_server = self._mock_smtp_server(mock_smtp_class)
 
         notifier = EmailNotifier(
             smtp_host="smtp.test",
             username="",
             from_addr="a@b.com",
-            to_addr="c@d.com",
+            to_addrs="c@d.com",
         )
         notifier.send("job1", "success", "Done")
 
@@ -89,14 +117,12 @@ class TestEmailNotifier:
 
     @patch("notifiers.email.smtplib.SMTP")
     def test_email_subject_format(self, mock_smtp_class):
-        mock_server = MagicMock()
-        mock_smtp_class.return_value.__enter__ = MagicMock(return_value=mock_server)
-        mock_smtp_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_server = self._mock_smtp_server(mock_smtp_class)
 
         notifier = EmailNotifier(
             smtp_host="smtp.test",
             from_addr="a@b.com",
-            to_addr="c@d.com",
+            to_addrs="c@d.com",
             subject_prefix="[backup]",
         )
         notifier.send("myjob", "failure", "Error occurred")
@@ -108,23 +134,59 @@ class TestEmailNotifier:
     def test_email_smtp_failure_raises(self, mock_smtp_class):
         mock_smtp_class.side_effect = OSError("Connection refused")
 
-        notifier = EmailNotifier(smtp_host="bad.host", from_addr="a@b.com", to_addr="c@d.com")
+        notifier = EmailNotifier(smtp_host="bad.host", from_addr="a@b.com", to_addrs="c@d.com")
         with pytest.raises(OSError, match="Connection refused"):
             notifier.send("job1", "failure", "Error")
 
     @patch("notifiers.email.smtplib.SMTP")
     def test_email_timeout_passed_to_smtp(self, mock_smtp_class):
         """timeout parameter is passed to smtplib.SMTP constructor."""
-        mock_server = MagicMock()
-        mock_smtp_class.return_value.__enter__ = MagicMock(return_value=mock_server)
-        mock_smtp_class.return_value.__exit__ = MagicMock(return_value=False)
+        self._mock_smtp_server(mock_smtp_class)
 
         notifier = EmailNotifier(
             smtp_host="smtp.test",
             from_addr="a@b.com",
-            to_addr="c@d.com",
+            to_addrs="c@d.com",
             timeout=15.0,
         )
         notifier.send("job1", "success", "Done")
 
         mock_smtp_class.assert_called_once_with("smtp.test", 587, timeout=15.0)
+
+    def test_email_send_empty_recipients_raises(self):
+        """send() with no recipients raises ConfigError."""
+        notifier = EmailNotifier(smtp_host="smtp.test", from_addr="a@b.com", to_addrs="")
+        with pytest.raises(ConfigError, match="no recipients"):
+            notifier.send("job1", "failure", "Error")
+
+
+class TestEmailNotifierFactory:
+    def test_email_missing_smtp_host_raises_config_error(self):
+        """email create() without 'smtp_host' → ConfigError."""
+        from notifiers.email import create
+        with pytest.raises(ConfigError, match="smtp_host"):
+            create({"smtp_port": 587, "from": "a@b.com"})
+
+    def test_factory_single_recipient_string(self):
+        """Factory with 'to' as a single string."""
+        from notifiers.email import create
+        notifier = create({"smtp_host": "smtp.test", "to": "ops@example.com"})
+        assert notifier.to_addrs == ["ops@example.com"]
+
+    def test_factory_multiple_recipients_list(self):
+        """Factory with 'to' as a YAML list."""
+        from notifiers.email import create
+        notifier = create({
+            "smtp_host": "smtp.test",
+            "to": ["alice@example.com", "bob@example.com"],
+        })
+        assert notifier.to_addrs == ["alice@example.com", "bob@example.com"]
+
+    def test_factory_multiple_recipients_comma_string(self):
+        """Factory with 'to' as a comma-separated string."""
+        from notifiers.email import create
+        notifier = create({
+            "smtp_host": "smtp.test",
+            "to": "alice@example.com, bob@example.com",
+        })
+        assert notifier.to_addrs == ["alice@example.com", "bob@example.com"]

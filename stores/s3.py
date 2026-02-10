@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -42,7 +43,17 @@ class S3Store(Store):
 
     def upload(self, local_path: str, remote_key: str) -> None:
         log.info("Uploading %s -> s3://%s/%s", local_path, self._bucket, remote_key)
+        local_size = os.path.getsize(local_path)
         self._client.upload_file(local_path, self._bucket, remote_key)
+
+        # Verify uploaded object size matches the local file
+        resp = self._client.head_object(Bucket=self._bucket, Key=remote_key)
+        remote_size = resp["ContentLength"]
+        if remote_size != local_size:
+            raise RuntimeError(
+                f"Upload verification failed for '{remote_key}': "
+                f"local size {local_size} != remote size {remote_size}"
+            )
 
     def download(self, remote_key: str, local_path: str) -> None:
         log.info(

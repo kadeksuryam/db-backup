@@ -110,19 +110,17 @@ class SSHStore(Store):
     def list(self, prefix: str) -> list[BackupInfo]:
         remote_dir = f"{self._base_path}/{prefix}"
 
-        # POSIX-portable: find files then get size with wc -c
         quoted_dir = shlex.quote(remote_dir)
-        # Build find expression matching all recognized backup extensions
+        # Build find expression matching all recognized backup extensions.
+        # Uses -printf to output size and path in a single atomic command,
+        # avoiding a fragile shell pipeline with wc -c.
         name_clauses = " -o ".join(
             f"-name '*{ext}'" for ext in BACKUP_EXTENSIONS
         )
         cmd = [
             "ssh", *self._ssh_opts(), self._ssh_dest(),
-            f"find {quoted_dir} \\( {name_clauses} \\) -type f 2>/dev/null "
-            f"| while IFS= read -r f; do "
-            f"size=$(wc -c < \"$f\"); "
-            f"echo \"$f\\t$size\"; "
-            f"done",
+            f"find {quoted_dir} \\( {name_clauses} \\) -type f "
+            f"-printf '%s\\t%p\\n' 2>/dev/null",
         ]
         result = self._run(cmd)
 
@@ -133,7 +131,7 @@ class SSHStore(Store):
             parts = line.split("\t", 1)
             if len(parts) != 2:
                 continue
-            full_path, size_str = parts
+            size_str, full_path = parts
             # key is relative to base_path
             key = full_path.removeprefix(self._base_path).lstrip("/")
             filename = os.path.basename(full_path)

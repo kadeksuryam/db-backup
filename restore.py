@@ -4,41 +4,41 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import tempfile
 
 from config import Datasource, build_prefix
 from engines import create_engine
-from stores import Store
-from utils import sha256_file
+from stores import BackupInfo, Store
+from utils import format_size, sha256_file
 
 log = logging.getLogger(__name__)
 
 
-def list_backups(store: Store, prefix: str, dbname: str) -> None:
-    """Print available backups for a job."""
+class RestoreError(Exception):
+    """Raised when a restore operation cannot proceed."""
+
+
+class RestoreAborted(Exception):
+    """Raised when the user declines to continue a restore."""
+
+
+def list_backups(store: Store, prefix: str, dbname: str) -> list[BackupInfo]:
+    """List available backups for a job. Returns the list for programmatic use."""
     full_prefix = build_prefix(prefix, dbname)
     backups = store.list(full_prefix)
 
     if not backups:
         print(f"No backups found under '{full_prefix}'")
-        return
+        return []
 
     print(f"{'Timestamp':<22} {'Size':>10}  {'Key'}")
     print("-" * 70)
     for b in backups:
         ts_str = b.timestamp.strftime("%Y-%m-%d %H:%M:%S")
-        if b.size >= 1024 * 1024 * 1024:
-            size_str = f"{b.size / (1024**3):.1f} GB"
-        elif b.size >= 1024 * 1024:
-            size_str = f"{b.size / (1024**2):.1f} MB"
-        elif b.size >= 1024:
-            size_str = f"{b.size / 1024:.1f} KB"
-        else:
-            size_str = f"{b.size} B"
-        print(f"{ts_str:<22} {size_str:>10}  {b.key}")
+        print(f"{ts_str:<22} {format_size(b.size):>10}  {b.key}")
 
     print(f"\nTotal: {len(backups)} backup(s)")
+    return backups
 
 
 def run_restore(
@@ -51,21 +51,25 @@ def run_restore(
     """Download and restore a backup.
 
     If filename is None, restores the latest backup.
+
+    Raises:
+        RestoreError: when no backups found or specified filename not found.
+        RestoreAborted: when the user declines to drop/recreate.
     """
     engine = create_engine(ds.engine)
     full_prefix = build_prefix(prefix, ds.database)
     backups = store.list(full_prefix)
 
     if not backups:
-        print(f"No backups found under '{full_prefix}'", file=sys.stderr)
-        sys.exit(1)
+        raise RestoreError(f"No backups found under '{full_prefix}'")
 
     if filename:
         # Find the matching backup
         match = [b for b in backups if b.filename == filename]
         if not match:
-            print(f"Backup '{filename}' not found. Use 'list' to see available backups.", file=sys.stderr)
-            sys.exit(1)
+            raise RestoreError(
+                f"Backup '{filename}' not found. Use 'list' to see available backups."
+            )
         target = match[0]
     else:
         target = backups[-1]  # latest (list is sorted oldest-first)
@@ -80,23 +84,27 @@ def run_restore(
         log.info("Verifying backup integrity: %s", target.filename)
         engine.verify(ds, local_path)
 
+        # Try to verify checksum via .sha256 sidecar.
+        # Download failures or invalid sidecars are non-fatal (backwards compat),
+        # but a genuine checksum mismatch is always fatal.
+        expected_checksum = None
         try:
             checksum_path = os.path.join(tmpdir, target.filename + ".sha256")
             store.download(target.key + ".sha256", checksum_path)
             with open(checksum_path) as f:
-                expected = f.read().strip()
-            if len(expected) != 64:
-                raise ValueError("invalid sidecar")
-            actual = sha256_file(local_path)
-            if actual != expected:
-                raise RuntimeError(
-                    f"Checksum mismatch: expected {expected}, got {actual}")
-            log.info("SHA256 checksum verified.")
-        except RuntimeError as e:
-            if "Checksum mismatch" in str(e):
-                raise
-            log.info("No valid SHA256 sidecar — skipping checksum verification.")
+                content = f.read().strip()
+            if len(content) == 64:
+                expected_checksum = content
         except Exception:
+            pass  # sidecar not available — will skip verification
+
+        if expected_checksum is not None:
+            actual = sha256_file(local_path)
+            if actual != expected_checksum:
+                raise RuntimeError(
+                    f"Checksum mismatch: expected {expected_checksum}, got {actual}")
+            log.info("SHA256 checksum verified.")
+        else:
             log.info("No SHA256 sidecar found — skipping checksum verification.")
 
         # Check existing data (only after download+verify succeed)
@@ -109,8 +117,7 @@ def run_restore(
                 print(f"Connection: {ds.engine}://{ds.user}@{ds.host}:{ds.port}/{ds.database}")
                 answer = input("Drop and recreate the database? [y/N]: ").strip()
                 if answer.lower() not in ("y", "yes"):
-                    print("Restore aborted.")
-                    sys.exit(0)
+                    raise RestoreAborted("Restore aborted by user.")
 
             log.info("Dropping and recreating database '%s'...", ds.database)
             engine.drop_and_recreate(ds)

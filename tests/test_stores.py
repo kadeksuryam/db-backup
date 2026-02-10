@@ -32,16 +32,33 @@ class TestCreateStore:
 
 
 class TestS3Store:
+    @patch("stores.s3.os.path.getsize", return_value=1024)
     @patch("stores.s3.boto3")
-    def test_upload(self, mock_boto):
+    def test_upload(self, mock_boto, mock_getsize):
         mock_client = MagicMock()
         mock_boto.session.Session.return_value.client.return_value = mock_client
+        mock_client.head_object.return_value = {"ContentLength": 1024}
 
         store = S3Store(bucket="mybucket")
         store.upload("/tmp/file.sql.gz", "prefix/file.sql.gz")
         mock_client.upload_file.assert_called_once_with(
             "/tmp/file.sql.gz", "mybucket", "prefix/file.sql.gz"
         )
+        mock_client.head_object.assert_called_once_with(
+            Bucket="mybucket", Key="prefix/file.sql.gz"
+        )
+
+    @patch("stores.s3.os.path.getsize", return_value=1024)
+    @patch("stores.s3.boto3")
+    def test_upload_size_mismatch_raises(self, mock_boto, mock_getsize):
+        """Upload succeeds but remote size differs → RuntimeError."""
+        mock_client = MagicMock()
+        mock_boto.session.Session.return_value.client.return_value = mock_client
+        mock_client.head_object.return_value = {"ContentLength": 512}
+
+        store = S3Store(bucket="mybucket")
+        with pytest.raises(RuntimeError, match="Upload verification failed"):
+            store.upload("/tmp/file.sql.gz", "prefix/file.sql.gz")
 
     @patch("stores.s3.boto3")
     def test_download(self, mock_boto):
@@ -235,8 +252,8 @@ class TestSSHStore:
     @patch("stores.ssh.subprocess.run")
     def test_list_parses_output(self, mock_run):
         output = (
-            "/data/backups/prod/db/db-20260101-120000.sql.gz\t1024\n"
-            "/data/backups/prod/db/db-20260102-120000.sql.gz\t2048\n"
+            "1024\t/data/backups/prod/db/db-20260101-120000.sql.gz\n"
+            "2048\t/data/backups/prod/db/db-20260102-120000.sql.gz\n"
         )
         mock_run.return_value = MagicMock(returncode=0, stdout=output)
 
@@ -260,9 +277,9 @@ class TestSSHStore:
     def test_list_malformed_lines_skipped(self, mock_run):
         """Lines without a tab separator are silently skipped."""
         output = (
-            "/data/backups/prod/db/db-20260101-120000.sql.gz\t1024\n"
+            "1024\t/data/backups/prod/db/db-20260101-120000.sql.gz\n"
             "this line has no tab\n"
-            "/data/backups/prod/db/db-20260102-120000.sql.gz\t2048\n"
+            "2048\t/data/backups/prod/db/db-20260102-120000.sql.gz\n"
         )
         mock_run.return_value = MagicMock(returncode=0, stdout=output)
         store = self._store()
@@ -273,8 +290,8 @@ class TestSSHStore:
     def test_list_unparseable_timestamp_skipped(self, mock_run):
         """Files with unparseable timestamps are silently skipped."""
         output = (
-            "/data/backups/prod/db/db-20260101-120000.sql.gz\t1024\n"
-            "/data/backups/prod/db/random-file.sql.gz\t500\n"
+            "1024\t/data/backups/prod/db/db-20260101-120000.sql.gz\n"
+            "500\t/data/backups/prod/db/random-file.sql.gz\n"
         )
         mock_run.return_value = MagicMock(returncode=0, stdout=output)
         store = self._store()
@@ -285,7 +302,7 @@ class TestSSHStore:
     @patch("stores.ssh.subprocess.run")
     def test_list_blank_lines_skipped(self, mock_run):
         """Blank lines in output are skipped."""
-        output = "\n\n/data/backups/prod/db/db-20260101-120000.sql.gz\t1024\n\n"
+        output = "\n\n1024\t/data/backups/prod/db/db-20260101-120000.sql.gz\n\n"
         mock_run.return_value = MagicMock(returncode=0, stdout=output)
         store = self._store()
         backups = store.list("prod/db")
@@ -340,9 +357,9 @@ class TestSSHStore:
     def test_list_mixed_extensions(self, mock_run):
         """SSH list parses mixed backup extensions."""
         output = (
-            "/data/backups/prod/db/db-20260101-120000.sql.gz\t1024\n"
-            "/data/backups/prod/db/db-20260102-120000.dump.zst\t2048\n"
-            "/data/backups/prod/db/db-20260103-120000.sql.lz4\t512\n"
+            "1024\t/data/backups/prod/db/db-20260101-120000.sql.gz\n"
+            "2048\t/data/backups/prod/db/db-20260102-120000.dump.zst\n"
+            "512\t/data/backups/prod/db/db-20260103-120000.sql.lz4\n"
         )
         mock_run.return_value = MagicMock(returncode=0, stdout=output)
         store = self._store()
@@ -360,6 +377,8 @@ class TestSSHStore:
         ssh_cmd_str = cmd[-1]
         for ext in BACKUP_EXTENSIONS:
             assert f"'*{ext}'" in ssh_cmd_str
+        # Verify -printf is used instead of shell pipeline
+        assert "-printf" in ssh_cmd_str
 
 
 class TestCreateStoreEdgeCases:
@@ -454,8 +473,8 @@ class TestSSHStoreEdgeCases:
 
     @patch("stores.ssh.subprocess.run")
     def test_list_non_numeric_size(self, mock_run):
-        """Non-numeric size from wc -c → should raise ValueError."""
-        output = "/data/backups/prod/db/db-20260101-120000.sql.gz\tNaN\n"
+        """Non-numeric size from find -printf → should raise ValueError."""
+        output = "NaN\t/data/backups/prod/db/db-20260101-120000.sql.gz\n"
         mock_run.return_value = MagicMock(returncode=0, stdout=output)
         store = SSHStore(host="h", user="u", path="/data/backups")
         with pytest.raises(ValueError):

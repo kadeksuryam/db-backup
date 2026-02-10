@@ -95,7 +95,8 @@ def compute_keep_set(
 
 
 def apply_retention(
-    store: Store, prefix: str, dbname: str, policy: RetentionPolicy
+    store: Store, prefix: str, dbname: str, policy: RetentionPolicy,
+    dry_run: bool = False,
 ) -> None:
     """List backups, compute retention, and delete expired ones."""
     full_prefix = build_prefix(prefix, dbname)
@@ -129,10 +130,20 @@ def apply_retention(
     )
 
     for b in to_delete:
-        log.info("Deleting expired backup: %s (%s)", b.filename, b.timestamp.strftime("%Y-%m-%d %H:%M:%S"))
-        store.delete(b.key)
+        if dry_run:
+            log.info("Would delete: %s (+ sidecar) (%s)", b.filename, b.timestamp.strftime("%Y-%m-%d %H:%M:%S"))
+        else:
+            log.info("Deleting expired backup: %s (%s)", b.filename, b.timestamp.strftime("%Y-%m-%d %H:%M:%S"))
+            store.delete(b.key)
+            try:
+                store.delete(b.key + ".sha256")
+            except Exception:
+                pass  # sidecar may not exist for older backups
 
     if to_delete:
-        log.info("Pruned %d expired backup(s).", len(to_delete))
+        if dry_run:
+            log.info("Dry run: would prune %d expired backup(s).", len(to_delete))
+        else:
+            log.info("Pruned %d expired backup(s).", len(to_delete))
     else:
         log.info("No expired backups to prune.")

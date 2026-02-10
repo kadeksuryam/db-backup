@@ -5,7 +5,11 @@ from __future__ import annotations
 import logging
 import os
 import shlex
+import shutil
 import subprocess
+import tempfile
+
+from config import ConfigError
 
 from . import BACKUP_EXTENSIONS, BackupInfo, Store, parse_timestamp
 
@@ -26,6 +30,8 @@ class SSHStore(Store):
         self._base_path = path
         self._port = port
         self._key_file = key_file
+        self._control_dir = tempfile.mkdtemp(prefix="dbbackup-ssh-")
+        self._control_path = os.path.join(self._control_dir, "ctrl-%h-%p-%r")
 
     def _connect_opts(self, port_flag: str) -> list[str]:
         """Build common SSH/SCP options. port_flag is '-p' for ssh, '-P' for scp."""
@@ -33,6 +39,9 @@ class SSHStore(Store):
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10",
+            "-o", f"ControlPath={self._control_path}",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=60",
             port_flag, str(self._port),
         ]
         if self._key_file:
@@ -57,6 +66,30 @@ class SSHStore(Store):
                 f"stderr: {result.stderr.strip()}"
             )
         return result
+
+    def close(self) -> None:
+        """Tear down the SSH ControlMaster connection and clean up."""
+        if self._control_dir and os.path.isdir(self._control_dir):
+            try:
+                subprocess.run(
+                    ["ssh", "-o", f"ControlPath={self._control_path}",
+                     "-O", "exit", self._ssh_dest()],
+                    capture_output=True, check=False,
+                )
+            except OSError:
+                pass
+            shutil.rmtree(self._control_dir, ignore_errors=True)
+            self._control_dir = ""
+
+    def __del__(self) -> None:
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
     def upload(self, local_path: str, remote_key: str) -> None:
         remote_dir = os.path.dirname(f"{self._base_path}/{remote_key}")
@@ -126,6 +159,9 @@ class SSHStore(Store):
 
 
 def create(config: dict) -> SSHStore:
+    for key in ("host", "user", "path"):
+        if key not in config:
+            raise ConfigError(f"Error: SSH store config is missing required '{key}' field")
     return SSHStore(
         host=config["host"],
         user=config["user"],

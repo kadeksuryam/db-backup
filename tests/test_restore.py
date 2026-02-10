@@ -98,8 +98,8 @@ class TestRunRestore:
         run_restore(_ds(), store, "prod")
 
         # Should pick the latest (last in sorted-oldest-first list)
-        store.download.assert_called_once()
-        downloaded_key = store.download.call_args[0][0]
+        # First download is the backup, second is the .sha256 sidecar
+        downloaded_key = store.download.call_args_list[0][0][0]
         assert "20260102" in downloaded_key
         mock_engine.restore.assert_called_once()
 
@@ -181,6 +181,10 @@ class TestRunRestore:
             _bi("prod/testdb/db-20260102-120000.sql.gz",
                  datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)),
         ]
+        def fake_download(key, path):
+            with open(path, "wb") as f:
+                f.write(b"data")
+        store.download.side_effect = fake_download
 
         with pytest.raises(SystemExit):
             run_restore(_ds(), store, "prod")
@@ -234,7 +238,7 @@ class TestRunRestore:
 
     @patch("restore.create_engine")
     def test_drop_recreate_failure_propagates(self, mock_create_engine):
-        """If drop_and_recreate fails, error propagates before download."""
+        """If drop_and_recreate fails, error propagates after download+verify."""
         mock_engine = MagicMock()
         mock_engine.count_tables.return_value = 10
         mock_engine.drop_and_recreate.side_effect = RuntimeError("permission denied")
@@ -245,11 +249,16 @@ class TestRunRestore:
             _bi("prod/testdb/db-20260102-120000.sql.gz",
                  datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)),
         ]
+        def fake_download(key, path):
+            with open(path, "wb") as f:
+                f.write(b"data")
+        store.download.side_effect = fake_download
 
         with pytest.raises(RuntimeError, match="permission denied"):
             run_restore(_ds(), store, "prod", auto_confirm=True)
 
-        store.download.assert_not_called()
+        assert store.download.call_count >= 1  # backup + possibly sidecar
+        mock_engine.verify.assert_called_once()
         mock_engine.restore.assert_not_called()
 
     @patch("restore.create_engine")
@@ -356,6 +365,10 @@ class TestRunRestoreEdgeCases:
             _bi("prod/testdb/db-20260102-120000.sql.gz",
                  datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)),
         ]
+        def fake_download(key, path):
+            with open(path, "wb") as f:
+                f.write(b"data")
+        store.download.side_effect = fake_download
 
         with pytest.raises(SystemExit):
             run_restore(_ds(), store, "prod")
@@ -395,13 +408,17 @@ class TestRunRestoreEdgeCases:
             _bi("prod/testdb/db-20260102-120000.sql.gz",
                  datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)),
         ]
+        def fake_download(key, path):
+            with open(path, "wb") as f:
+                f.write(b"data")
+        store.download.side_effect = fake_download
 
         with pytest.raises(SystemExit):
             run_restore(_ds(), store, "prod")
 
     @patch("restore.create_engine")
-    def test_download_failure_after_drop_propagates(self, mock_create_engine):
-        """If download fails after database was already dropped, error propagates."""
+    def test_download_failure_prevents_drop(self, mock_create_engine):
+        """If download fails, database is NOT dropped (download happens first)."""
         mock_engine = MagicMock()
         mock_engine.count_tables.return_value = 5
         mock_create_engine.return_value = mock_engine
@@ -416,7 +433,169 @@ class TestRunRestoreEdgeCases:
         with pytest.raises(RuntimeError, match="network error"):
             run_restore(_ds(), store, "prod", auto_confirm=True)
 
-        # Drop was called before download
-        mock_engine.drop_and_recreate.assert_called_once()
-        # Restore was NOT called (download failed first)
+        # Drop should NOT have been called (download failed first)
+        mock_engine.drop_and_recreate.assert_not_called()
         mock_engine.restore.assert_not_called()
+
+
+class TestRestoreVerification:
+    @patch("restore.create_engine")
+    def test_verify_called_before_restore(self, mock_create_engine):
+        """engine.verify called after download and before engine.restore."""
+        mock_engine = MagicMock()
+        mock_engine.count_tables.return_value = 0
+        mock_create_engine.return_value = mock_engine
+
+        call_order = []
+        mock_engine.verify.side_effect = lambda ds, path: call_order.append("verify")
+        mock_engine.restore.side_effect = lambda ds, path: call_order.append("restore")
+
+        store = MagicMock()
+        store.list.return_value = [
+            _bi("prod/testdb/db-20260102-120000.sql.gz",
+                 datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)),
+        ]
+        def fake_download(key, path):
+            call_order.append("download")
+            with open(path, "wb") as f:
+                f.write(b"data")
+        store.download.side_effect = fake_download
+
+        run_restore(_ds(), store, "prod")
+
+        # download → verify → download (sidecar) → restore
+        assert call_order[0] == "download"
+        assert call_order[1] == "verify"
+        assert call_order[-1] == "restore"
+
+    @patch("restore.create_engine")
+    def test_verify_failure_prevents_restore(self, mock_create_engine):
+        """engine.verify raises → engine.restore never called."""
+        mock_engine = MagicMock()
+        mock_engine.count_tables.return_value = 0
+        mock_engine.verify.side_effect = RuntimeError("corrupt backup")
+        mock_create_engine.return_value = mock_engine
+
+        store = MagicMock()
+        store.list.return_value = [
+            _bi("prod/testdb/db-20260102-120000.sql.gz",
+                 datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)),
+        ]
+        def fake_download(key, path):
+            with open(path, "wb") as f:
+                f.write(b"data")
+        store.download.side_effect = fake_download
+
+        with pytest.raises(RuntimeError, match="corrupt backup"):
+            run_restore(_ds(), store, "prod")
+
+        mock_engine.restore.assert_not_called()
+
+    @patch("restore.create_engine")
+    def test_verify_failure_prevents_drop(self, mock_create_engine):
+        """Verify fails → DB is NOT dropped (verify happens before drop)."""
+        mock_engine = MagicMock()
+        mock_engine.count_tables.return_value = 10
+        mock_engine.verify.side_effect = RuntimeError("corrupt backup")
+        mock_create_engine.return_value = mock_engine
+
+        store = MagicMock()
+        store.list.return_value = [
+            _bi("prod/testdb/db-20260102-120000.sql.gz",
+                 datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)),
+        ]
+        def fake_download(key, path):
+            with open(path, "wb") as f:
+                f.write(b"data")
+        store.download.side_effect = fake_download
+
+        with pytest.raises(RuntimeError, match="corrupt backup"):
+            run_restore(_ds(), store, "prod", auto_confirm=True)
+
+        mock_engine.drop_and_recreate.assert_not_called()
+        mock_engine.restore.assert_not_called()
+
+
+class TestRestoreChecksum:
+    @patch("restore.create_engine")
+    def test_checksum_verified_when_sidecar_present(self, mock_create_engine):
+        """Valid .sha256 sidecar → checksum verified, restore proceeds."""
+        import hashlib
+
+        mock_engine = MagicMock()
+        mock_engine.count_tables.return_value = 0
+        mock_create_engine.return_value = mock_engine
+
+        backup_data = b"backup content"
+        expected_hash = hashlib.sha256(backup_data).hexdigest()
+
+        store = MagicMock()
+        store.list.return_value = [
+            _bi("prod/testdb/db-20260102-120000.sql.gz",
+                 datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)),
+        ]
+
+        def fake_download(key, path):
+            if key.endswith(".sha256"):
+                with open(path, "w") as f:
+                    f.write(expected_hash)
+            else:
+                with open(path, "wb") as f:
+                    f.write(backup_data)
+
+        store.download.side_effect = fake_download
+
+        run_restore(_ds(), store, "prod")
+        mock_engine.restore.assert_called_once()
+
+    @patch("restore.create_engine")
+    def test_checksum_mismatch_raises(self, mock_create_engine):
+        """Checksum mismatch → RuntimeError, restore aborted."""
+        mock_engine = MagicMock()
+        mock_engine.count_tables.return_value = 0
+        mock_create_engine.return_value = mock_engine
+
+        store = MagicMock()
+        store.list.return_value = [
+            _bi("prod/testdb/db-20260102-120000.sql.gz",
+                 datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)),
+        ]
+
+        def fake_download(key, path):
+            if key.endswith(".sha256"):
+                with open(path, "w") as f:
+                    f.write("a" * 64)  # wrong hash
+            else:
+                with open(path, "wb") as f:
+                    f.write(b"backup content")
+
+        store.download.side_effect = fake_download
+
+        with pytest.raises(RuntimeError, match="Checksum mismatch"):
+            run_restore(_ds(), store, "prod")
+
+        mock_engine.restore.assert_not_called()
+
+    @patch("restore.create_engine")
+    def test_missing_sidecar_gracefully_skipped(self, mock_create_engine):
+        """No .sha256 sidecar → restore proceeds (backwards compatible)."""
+        mock_engine = MagicMock()
+        mock_engine.count_tables.return_value = 0
+        mock_create_engine.return_value = mock_engine
+
+        store = MagicMock()
+        store.list.return_value = [
+            _bi("prod/testdb/db-20260102-120000.sql.gz",
+                 datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)),
+        ]
+
+        def fake_download(key, path):
+            if key.endswith(".sha256"):
+                raise RuntimeError("not found")
+            with open(path, "wb") as f:
+                f.write(b"backup content")
+
+        store.download.side_effect = fake_download
+
+        run_restore(_ds(), store, "prod")
+        mock_engine.restore.assert_called_once()

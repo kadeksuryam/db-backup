@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from config import ConfigError
+
 
 # All recognized backup file extensions, compound extensions first so
 # they are matched before their shorter suffixes.
@@ -70,6 +72,16 @@ class Store(ABC):
     def delete(self, remote_key: str) -> None:
         """Delete a file from the store."""
 
+    def close(self) -> None:
+        """Release any resources held by the store. No-op by default."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
 
 # Map of store type names to module names within this package.
 _STORE_TYPES = {
@@ -86,7 +98,7 @@ def create_store(config: dict) -> Store:
     """
     store_type = config.get("type")
     if store_type not in _STORE_TYPES:
-        raise ValueError(
+        raise ConfigError(
             f"Unknown store type '{store_type}'. "
             f"Available: {', '.join(_STORE_TYPES)}"
         )

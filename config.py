@@ -5,13 +5,17 @@ from __future__ import annotations
 import logging
 import os
 import stat
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
 log = logging.getLogger(__name__)
+
+
+class ConfigError(Exception):
+    """Raised when configuration loading or validation fails."""
+
 
 DEFAULT_CONFIG_PATH = "/config/config.yaml"
 
@@ -47,12 +51,28 @@ class RetentionPolicy:
 
 
 @dataclass
+class RetryPolicy:
+    max_attempts: int = 1         # total attempts (1 = no retry)
+    delay: float = 30.0           # seconds before first retry
+    backoff_multiplier: float = 2.0  # multiplier for each subsequent retry
+
+
+@dataclass
+class NotificationRule:
+    notifier_name: str    # references key in 'notifications' section
+    on: str = "failure"   # "failure", "success", or "always"
+
+
+@dataclass
 class Job:
     name: str
     datasource: Datasource
     store_config: dict
     prefix: str
     retention: RetentionPolicy = field(default_factory=RetentionPolicy)
+    verify: bool = False
+    retry: RetryPolicy = field(default_factory=RetryPolicy)
+    notifications: list[NotificationRule] = field(default_factory=list)
 
 
 def load(config_path: str | None = None) -> dict:
@@ -60,8 +80,7 @@ def load(config_path: str | None = None) -> dict:
     path = config_path or os.environ.get("DBBACKUP_CONFIG", DEFAULT_CONFIG_PATH)
 
     if not Path(path).is_file():
-        print(f"Error: config file not found: {path}", file=sys.stderr)
-        sys.exit(1)
+        raise ConfigError(f"Error: config file not found: {path}")
 
     # Warn if config file is readable by group or others (may contain credentials)
     try:
@@ -79,8 +98,7 @@ def load(config_path: str | None = None) -> dict:
         raw = yaml.safe_load(f)
 
     if not isinstance(raw, dict):
-        print(f"Error: config file must be a YAML mapping", file=sys.stderr)
-        sys.exit(1)
+        raise ConfigError("Error: config file must be a YAML mapping")
 
     return raw
 
@@ -100,12 +118,10 @@ def resolve_env(config: dict) -> dict:
             real_key = key.removesuffix("_env")
             env_val = os.environ.get(value)
             if env_val is None:
-                print(
+                raise ConfigError(
                     f"Error: environment variable '{value}' "
-                    f"(referenced by '{key}') is not set",
-                    file=sys.stderr,
+                    f"(referenced by '{key}') is not set"
                 )
-                sys.exit(1)
             resolved[real_key] = env_val
         else:
             resolved[key] = value
@@ -116,40 +132,40 @@ def get_datasource(raw_config: dict, name: str) -> Datasource:
     """Get a Datasource by name from the config."""
     datasources = raw_config.get("datasources", {})
     if name not in datasources:
-        print(
+        raise ConfigError(
             f"Error: datasource '{name}' not found. "
-            f"Available: {', '.join(datasources)}",
-            file=sys.stderr,
+            f"Available: {', '.join(datasources)}"
         )
-        sys.exit(1)
 
     ds = resolve_env(datasources[name])
 
     engine = ds.get("engine")
     if not engine:
-        print(
+        raise ConfigError(
             f"Error: datasource '{name}' is missing required 'engine' field "
-            f"(e.g. engine: postgres)",
-            file=sys.stderr,
+            f"(e.g. engine: postgres)"
         )
-        sys.exit(1)
 
     # Collect engine-specific options (anything not in the standard keys)
     options = {k: v for k, v in ds.items() if k not in _DS_STANDARD_KEYS}
 
     for required in ("port", "database"):
         if required not in ds:
-            print(
-                f"Error: datasource '{name}' is missing required '{required}' field",
-                file=sys.stderr,
+            raise ConfigError(
+                f"Error: datasource '{name}' is missing required '{required}' field"
             )
-            sys.exit(1)
+
+    port = int(ds["port"])
+    if not (1 <= port <= 65535):
+        raise ConfigError(
+            f"Error: datasource '{name}' has invalid port {port}. Must be 1-65535."
+        )
 
     return Datasource(
         name=name,
         engine=engine,
         host=ds.get("host", "localhost"),
-        port=int(ds["port"]),
+        port=port,
         user=ds.get("user", ""),
         password=ds.get("password", ""),
         database=ds["database"],
@@ -161,11 +177,9 @@ def get_store_config(raw_config: dict, name: str) -> dict:
     """Get a resolved store config dict by name."""
     stores = raw_config.get("stores", {})
     if name not in stores:
-        print(
-            f"Error: store '{name}' not found. Available: {', '.join(stores)}",
-            file=sys.stderr,
+        raise ConfigError(
+            f"Error: store '{name}' not found. Available: {', '.join(stores)}"
         )
-        sys.exit(1)
 
     return resolve_env(stores[name])
 
@@ -174,13 +188,15 @@ def get_job(raw_config: dict, name: str) -> Job:
     """Get a fully resolved Job by name."""
     jobs = raw_config.get("jobs", {})
     if name not in jobs:
-        print(
-            f"Error: job '{name}' not found. Available: {', '.join(jobs)}",
-            file=sys.stderr,
+        raise ConfigError(
+            f"Error: job '{name}' not found. Available: {', '.join(jobs)}"
         )
-        sys.exit(1)
 
     job_cfg = jobs[name]
+    if "datasource" not in job_cfg:
+        raise ConfigError(f"Error: job '{name}' is missing required 'datasource' field")
+    if "store" not in job_cfg:
+        raise ConfigError(f"Error: job '{name}' is missing required 'store' field")
     ds = get_datasource(raw_config, job_cfg["datasource"])
     store_cfg = get_store_config(raw_config, job_cfg["store"])
 
@@ -193,13 +209,71 @@ def get_job(raw_config: dict, name: str) -> Job:
         keep_yearly=ret_cfg.get("keep_yearly", 0),
     )
 
+    retry_cfg = job_cfg.get("retry", {})
+    try:
+        retry = RetryPolicy(
+            max_attempts=int(retry_cfg.get("max_attempts", 1)),
+            delay=float(retry_cfg.get("delay", 30)),
+            backoff_multiplier=float(retry_cfg.get("backoff_multiplier", 2)),
+        )
+    except (ValueError, TypeError) as exc:
+        raise ConfigError(f"Error: job '{name}' has invalid retry config: {exc}") from exc
+    if retry.max_attempts < 1:
+        raise ConfigError(
+            f"Error: job '{name}' retry.max_attempts must be >= 1, got {retry.max_attempts}"
+        )
+    if retry.delay < 0:
+        raise ConfigError(
+            f"Error: job '{name}' retry.delay must be >= 0, got {retry.delay}"
+        )
+    if retry.backoff_multiplier < 1:
+        raise ConfigError(
+            f"Error: job '{name}' retry.backoff_multiplier must be >= 1, "
+            f"got {retry.backoff_multiplier}"
+        )
+
+    notifications = []
+    for rule_cfg in job_cfg.get("notify", []):
+        notifier_name = rule_cfg.get("notifier")
+        if not notifier_name:
+            raise ConfigError(
+                f"Error: job '{name}' notify rule is missing 'notifier' key"
+            )
+        on = rule_cfg.get("on", "failure")
+        if on not in ("failure", "success", "always"):
+            raise ConfigError(
+                f"Error: job '{name}' notify rule has invalid 'on' value '{on}'. "
+                f"Must be one of: failure, success, always"
+            )
+        # Validate that the referenced notifier exists in config
+        notifiers_section = raw_config.get("notifications", {})
+        if notifier_name not in notifiers_section:
+            raise ConfigError(
+                f"Error: job '{name}' references notifier '{notifier_name}' "
+                f"which is not defined. Available: {', '.join(notifiers_section)}"
+            )
+        notifications.append(NotificationRule(notifier_name=notifier_name, on=on))
+
     return Job(
         name=name,
         datasource=ds,
         store_config=store_cfg,
         prefix=job_cfg.get("prefix", ""),
         retention=retention,
+        verify=bool(job_cfg.get("verify", False)),
+        retry=retry,
+        notifications=notifications,
     )
+
+
+def get_notifier_config(raw_config: dict, name: str) -> dict:
+    """Get a resolved notifier config dict by name."""
+    notifiers = raw_config.get("notifications", {})
+    if name not in notifiers:
+        raise ConfigError(
+            f"Error: notifier '{name}' not found. Available: {', '.join(notifiers)}"
+        )
+    return resolve_env(notifiers[name])
 
 
 def get_all_job_names(raw_config: dict) -> list[str]:

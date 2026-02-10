@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-from stores import create_store, BackupInfo, BACKUP_EXTENSIONS
+from config import ConfigError
+from stores import create_store, BackupInfo, BACKUP_EXTENSIONS, Store
 from stores.s3 import S3Store
 from stores.ssh import SSHStore
 
@@ -25,7 +27,7 @@ class TestCreateStore:
         assert isinstance(store, SSHStore)
 
     def test_unknown_type_raises(self):
-        with pytest.raises(ValueError, match="Unknown store type"):
+        with pytest.raises(ConfigError, match="Unknown store type"):
             create_store({"type": "gcs"})
 
 
@@ -362,13 +364,38 @@ class TestSSHStore:
 
 class TestCreateStoreEdgeCases:
     def test_missing_type_key_raises(self):
-        """Config with no 'type' key → raises ValueError."""
-        with pytest.raises(ValueError, match="Unknown store type 'None'"):
+        """Config with no 'type' key → raises ConfigError."""
+        with pytest.raises(ConfigError, match="Unknown store type 'None'"):
             create_store({"bucket": "b"})
 
     def test_empty_config_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ConfigError):
             create_store({})
+
+    @patch("stores.s3.boto3")
+    def test_s3_missing_bucket_raises_config_error(self, mock_boto):
+        """S3 create() without 'bucket' → ConfigError."""
+        from stores.s3 import create
+        with pytest.raises(ConfigError, match="bucket"):
+            create({"endpoint": "https://r2.example.com"})
+
+    def test_ssh_missing_host_raises_config_error(self):
+        """SSH create() without 'host' → ConfigError."""
+        from stores.ssh import create
+        with pytest.raises(ConfigError, match="host"):
+            create({"user": "u", "path": "/p"})
+
+    def test_ssh_missing_user_raises_config_error(self):
+        """SSH create() without 'user' → ConfigError."""
+        from stores.ssh import create
+        with pytest.raises(ConfigError, match="user"):
+            create({"host": "h", "path": "/p"})
+
+    def test_ssh_missing_path_raises_config_error(self):
+        """SSH create() without 'path' → ConfigError."""
+        from stores.ssh import create
+        with pytest.raises(ConfigError, match="path"):
+            create({"host": "h", "user": "u"})
 
 
 class TestS3StoreEdgeCases:
@@ -514,3 +541,68 @@ class TestSSHShellInjectionPrevention:
         opts = store._ssh_opts()
         assert "StrictHostKeyChecking=accept-new" in opts
         assert "StrictHostKeyChecking=no" not in opts
+
+
+class TestSSHControlMaster:
+    def test_connect_opts_has_control_master(self):
+        """SSH options include ControlPath, ControlMaster, ControlPersist."""
+        store = SSHStore(host="h", user="u", path="/p")
+        opts = store._ssh_opts()
+        opts_str = " ".join(opts)
+        assert "ControlMaster=auto" in opts_str
+        assert "ControlPersist=60" in opts_str
+        assert "ControlPath=" in opts_str
+        store.close()
+
+    @patch("stores.ssh.subprocess.run")
+    def test_close_sends_control_exit(self, mock_run):
+        """close() sends ssh -O exit to tear down master."""
+        store = SSHStore(host="h", user="u", path="/p")
+        control_dir = store._control_dir
+        assert os.path.isdir(control_dir)
+
+        mock_run.return_value = MagicMock(returncode=0)
+        store.close()
+
+        # ssh -O exit should have been called
+        assert mock_run.called
+        cmd = mock_run.call_args[0][0]
+        assert "-O" in cmd
+        assert "exit" in cmd
+
+    @patch("stores.ssh.subprocess.run")
+    def test_context_manager(self, mock_run):
+        """SSHStore works as a context manager and calls close on exit."""
+        mock_run.return_value = MagicMock(returncode=0)
+        with SSHStore(host="h", user="u", path="/p") as store:
+            assert isinstance(store, SSHStore)
+            control_dir = store._control_dir
+            assert os.path.isdir(control_dir)
+        # After exit, close should have been called
+        assert mock_run.called
+
+
+class TestStoreBaseClass:
+    """Store ABC has close() and context manager protocol."""
+
+    def test_store_has_close_method(self):
+        """Store base class defines a close() method."""
+        assert hasattr(Store, "close")
+
+    def test_store_context_manager_protocol(self):
+        """Store base class supports context manager protocol."""
+
+        class DummyStore(Store):
+            def upload(self, local_path, remote_key): pass
+            def download(self, remote_key, local_path): pass
+            def list(self, prefix): return []
+            def delete(self, remote_key): pass
+
+        closed = []
+        store = DummyStore()
+        store.close = lambda: closed.append(True)
+
+        with store as s:
+            assert s is store
+
+        assert closed == [True]

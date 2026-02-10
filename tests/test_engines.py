@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import stat
 import subprocess
 from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-from config import Datasource
+from config import ConfigError, Datasource
 from engines import create_engine, Engine
 from engines.postgres import (
     PostgresEngine, _validate_identifier, _detect_from_extension,
-    _resolve_format, _resolve_compression,
+    _resolve_format, _resolve_compression, _resolve_timeout,
 )
 
 
@@ -37,7 +40,7 @@ class TestCreateEngine:
         assert isinstance(engine, PostgresEngine)
 
     def test_unknown_engine_raises(self):
-        with pytest.raises(ValueError, match="Unknown engine type 'mysql'"):
+        with pytest.raises(ConfigError, match="Unknown engine type 'mysql'"):
             create_engine("mysql")
 
 
@@ -104,7 +107,7 @@ class TestPostgresEngine:
             MagicMock(returncode=0, stdout="170002"),
         ]
         engine = PostgresEngine()
-        import logging
+
         with caplog.at_level(logging.WARNING):
             engine.check_version_compat(_ds())
         assert "older than server" in caplog.text
@@ -146,7 +149,7 @@ class TestPostgresEngine:
             MagicMock(returncode=0, stdout="140005"),
         ]
         engine = PostgresEngine()
-        import logging
+
         with caplog.at_level(logging.WARNING):
             engine.check_version_compat(_ds())
         assert "older than server" not in caplog.text
@@ -203,6 +206,7 @@ class TestPostgresEngine:
         # Mock gzip process
         mock_gzip = MagicMock()
         mock_gzip.wait.return_value = 0
+        mock_gzip.returncode = 0
 
         mock_popen.side_effect = [mock_dump, mock_gzip]
 
@@ -231,6 +235,7 @@ class TestPostgresEngine:
 
         mock_gzip = MagicMock()
         mock_gzip.wait.return_value = 0
+        mock_gzip.returncode = 0
 
         mock_popen.side_effect = [mock_dump, mock_gzip]
 
@@ -249,6 +254,7 @@ class TestPostgresEngine:
         mock_gunzip.stdout = MagicMock()
         mock_gunzip.stdout.close = MagicMock()
         mock_gunzip.wait.return_value = 0
+        mock_gunzip.returncode = 0
 
         mock_psql = MagicMock()
         mock_psql.communicate.return_value = (b"", b"")
@@ -268,6 +274,7 @@ class TestPostgresEngine:
         mock_gunzip.stdout = MagicMock()
         mock_gunzip.stdout.close = MagicMock()
         mock_gunzip.wait.return_value = 0
+        mock_gunzip.returncode = 0
 
         mock_psql = MagicMock()
         mock_psql.communicate.return_value = (b"", b"ERROR: syntax error")
@@ -359,6 +366,7 @@ class TestPostgresEngine:
 
         mock_compress = MagicMock()
         mock_compress.wait.return_value = 0
+        mock_compress.returncode = 0
 
         mock_popen.side_effect = [mock_dump, mock_compress]
 
@@ -386,6 +394,7 @@ class TestPostgresEngine:
 
         mock_compress = MagicMock()
         mock_compress.wait.return_value = 0
+        mock_compress.returncode = 0
 
         mock_popen.side_effect = [mock_dump, mock_compress]
 
@@ -412,6 +421,7 @@ class TestPostgresEngine:
 
         mock_compress = MagicMock()
         mock_compress.wait.return_value = 0
+        mock_compress.returncode = 0
 
         mock_popen.side_effect = [mock_dump, mock_compress]
 
@@ -440,6 +450,26 @@ class TestPostgresEngine:
 
         assert mock_popen.call_count == 1
 
+    # -- compression_level validation --------------------------------------
+
+    def test_compression_level_string_raises(self):
+        """Non-integer compression_level → ValueError."""
+        ds = _ds(options={"compression_level": "fast"})
+        with pytest.raises(ValueError, match="Invalid compression_level"):
+            _resolve_compression(ds)
+
+    def test_compression_level_negative_raises(self):
+        """Negative compression_level → ValueError."""
+        ds = _ds(options={"compression_level": -1})
+        with pytest.raises(ValueError, match="compression_level must be between"):
+            _resolve_compression(ds)
+
+    def test_compression_level_zero_raises(self):
+        """compression_level 0 → ValueError."""
+        ds = _ds(options={"compression_level": 0})
+        with pytest.raises(ValueError, match="compression_level must be between"):
+            _resolve_compression(ds)
+
     # -- dump with custom compression_level -------------------------------
 
     @patch("engines.postgres.subprocess.Popen")
@@ -458,6 +488,7 @@ class TestPostgresEngine:
 
         mock_compress = MagicMock()
         mock_compress.wait.return_value = 0
+        mock_compress.returncode = 0
 
         mock_popen.side_effect = [mock_dump, mock_compress]
 
@@ -478,6 +509,7 @@ class TestPostgresEngine:
         mock_decompress.stdout = MagicMock()
         mock_decompress.stdout.close = MagicMock()
         mock_decompress.wait.return_value = 0
+        mock_decompress.returncode = 0
 
         mock_restore = MagicMock()
         mock_restore.communicate.return_value = (b"", b"")
@@ -504,6 +536,7 @@ class TestPostgresEngine:
         mock_decompress.stdout = MagicMock()
         mock_decompress.stdout.close = MagicMock()
         mock_decompress.wait.return_value = 0
+        mock_decompress.returncode = 0
 
         mock_restore = MagicMock()
         mock_restore.communicate.return_value = (b"", b"")
@@ -528,6 +561,7 @@ class TestPostgresEngine:
         mock_decompress.stdout = MagicMock()
         mock_decompress.stdout.close = MagicMock()
         mock_decompress.wait.return_value = 0
+        mock_decompress.returncode = 0
 
         mock_restore = MagicMock()
         mock_restore.communicate.return_value = (b"", b"")
@@ -574,6 +608,7 @@ class TestPostgresEngine:
         mock_decompress.stdout = MagicMock()
         mock_decompress.stdout.close = MagicMock()
         mock_decompress.wait.return_value = 0
+        mock_decompress.returncode = 0
 
         mock_restore = MagicMock()
         mock_restore.communicate.return_value = (b"", b"")
@@ -612,19 +647,125 @@ class TestPostgresEngine:
         with pytest.raises(ValueError, match="Unrecognized backup file extension"):
             _detect_from_extension("backup.tar.gz")
 
+    # -- dump compressor exit code checking ---------------------------------
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_dump_compressor_failure_raises(self, mock_popen, tmp_path):
+        """pg_dump OK, gzip fails → RuntimeError with 'compressor failed'."""
+        outfile = tmp_path / "test.sql.gz"
+
+        mock_dump = MagicMock()
+        mock_dump.stdout = MagicMock()
+        mock_dump.stdout.close = MagicMock()
+        mock_dump.stderr = MagicMock()
+        mock_dump.stderr.read.return_value = b""
+        mock_dump.wait.return_value = 0
+        mock_dump.returncode = 0
+
+        mock_gzip = MagicMock()
+        mock_gzip.wait.return_value = 1
+        mock_gzip.returncode = 1
+        mock_gzip.stderr = MagicMock()
+        mock_gzip.stderr.read.return_value = b"gzip: broken pipe"
+
+        mock_popen.side_effect = [mock_dump, mock_gzip]
+
+        engine = PostgresEngine()
+        with pytest.raises(RuntimeError, match="compressor failed"):
+            engine.dump(_ds(), str(outfile))
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_dump_both_fail_reports_both(self, mock_popen, tmp_path):
+        """Both pg_dump and gzip fail → message contains both errors."""
+        outfile = tmp_path / "test.sql.gz"
+
+        mock_dump = MagicMock()
+        mock_dump.stdout = MagicMock()
+        mock_dump.stdout.close = MagicMock()
+        mock_dump.stderr = MagicMock()
+        mock_dump.stderr.read.return_value = b"connection refused"
+        mock_dump.wait.return_value = 1
+        mock_dump.returncode = 1
+
+        mock_gzip = MagicMock()
+        mock_gzip.wait.return_value = 1
+        mock_gzip.returncode = 1
+        mock_gzip.stderr = MagicMock()
+        mock_gzip.stderr.read.return_value = b"broken pipe"
+
+        mock_popen.side_effect = [mock_dump, mock_gzip]
+
+        engine = PostgresEngine()
+        with pytest.raises(RuntimeError) as exc_info:
+            engine.dump(_ds(), str(outfile))
+        assert "pg_dump failed" in str(exc_info.value)
+        assert "compressor failed" in str(exc_info.value)
+
+    # -- restore decompressor exit code checking ------------------------------
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_restore_decompressor_failure_raises(self, mock_popen, tmp_path):
+        """gunzip fails, psql OK → RuntimeError with 'decompressor failed'."""
+        infile = tmp_path / "test.sql.gz"
+        infile.write_bytes(b"fake")
+
+        mock_gunzip = MagicMock()
+        mock_gunzip.stdout = MagicMock()
+        mock_gunzip.stdout.close = MagicMock()
+        mock_gunzip.wait.return_value = 1
+        mock_gunzip.returncode = 1
+        mock_gunzip.stderr = MagicMock()
+        mock_gunzip.stderr.read.return_value = b"unexpected end of file"
+
+        mock_psql = MagicMock()
+        mock_psql.communicate.return_value = (b"", b"")
+        mock_psql.returncode = 0
+
+        mock_popen.side_effect = [mock_gunzip, mock_psql]
+
+        engine = PostgresEngine()
+        with pytest.raises(RuntimeError, match="decompressor failed"):
+            engine.restore(_ds(), str(infile))
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_restore_both_fail_reports_both(self, mock_popen, tmp_path):
+        """Both decompressor and psql fail → message contains both errors."""
+        infile = tmp_path / "test.sql.gz"
+        infile.write_bytes(b"fake")
+
+        mock_gunzip = MagicMock()
+        mock_gunzip.stdout = MagicMock()
+        mock_gunzip.stdout.close = MagicMock()
+        mock_gunzip.wait.return_value = 1
+        mock_gunzip.returncode = 1
+        mock_gunzip.stderr = MagicMock()
+        mock_gunzip.stderr.read.return_value = b"corrupt input"
+
+        mock_psql = MagicMock()
+        mock_psql.communicate.return_value = (b"", b"ERROR: syntax error")
+        mock_psql.returncode = 3
+
+        mock_popen.side_effect = [mock_gunzip, mock_psql]
+
+        engine = PostgresEngine()
+        with pytest.raises(RuntimeError) as exc_info:
+            engine.restore(_ds(), str(infile))
+        assert "decompressor failed" in str(exc_info.value)
+        assert "psql restore failed" in str(exc_info.value)
+
 
 class TestCreateEngineEdgeCases:
     def test_empty_string_engine_raises(self):
-        with pytest.raises(ValueError, match="Unknown engine type"):
+        with pytest.raises(ConfigError, match="Unknown engine type"):
             create_engine("")
 
     def test_none_engine_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ConfigError):
             create_engine(None)
 
     def test_case_sensitive(self):
         """Engine types are case-sensitive."""
-        with pytest.raises(ValueError):
+        with pytest.raises(ConfigError):
             create_engine("Postgres")
 
 
@@ -642,7 +783,7 @@ class TestPostgresEngineEdgeCases:
             MagicMock(returncode=0, stdout="140002"),
         ]
         engine = PostgresEngine()
-        import logging
+
         with caplog.at_level(logging.WARNING):
             engine.check_version_compat(_ds())
         assert "older than server" not in caplog.text
@@ -674,6 +815,7 @@ class TestPostgresEngineEdgeCases:
         mock_gunzip.stdout = MagicMock()
         mock_gunzip.stdout.close = MagicMock()
         mock_gunzip.wait.return_value = 0
+        mock_gunzip.returncode = 0
 
         mock_psql = MagicMock()
         mock_psql.communicate.return_value = (b"", b"")
@@ -766,16 +908,216 @@ class TestSQLInjectionPrevention:
 
         mock_gzip = MagicMock()
         mock_gzip.wait.return_value = 0
+        mock_gzip.returncode = 0
 
         mock_popen.side_effect = [mock_dump, mock_gzip]
 
         engine = PostgresEngine()
         engine.dump(_ds(), str(outfile))
 
-        import os, stat
+
         mode = os.stat(str(outfile)).st_mode
         # File should NOT be group/other readable
         assert not (mode & stat.S_IRGRP)
         assert not (mode & stat.S_IROTH)
         assert not (mode & stat.S_IWGRP)
         assert not (mode & stat.S_IWOTH)
+
+
+class TestTimeout:
+    """Tests for _resolve_timeout and timeout behaviour."""
+
+    def test_resolve_timeout_none_by_default(self):
+        ds = _ds()
+        assert _resolve_timeout(ds) is None
+
+    def test_resolve_timeout_from_options(self):
+        ds = _ds(options={"timeout": 300})
+        assert _resolve_timeout(ds) == 300.0
+
+    def test_resolve_timeout_string(self):
+        ds = _ds(options={"timeout": "60"})
+        assert _resolve_timeout(ds) == 60.0
+
+    def test_resolve_timeout_zero_raises(self):
+        ds = _ds(options={"timeout": 0})
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            _resolve_timeout(ds)
+
+    def test_resolve_timeout_negative_raises(self):
+        ds = _ds(options={"timeout": -10})
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            _resolve_timeout(ds)
+
+    @patch("engines.postgres.subprocess.run")
+    def test_check_connectivity_timeout(self, mock_run):
+        """TimeoutExpired from subprocess.run → TimeoutError raised."""
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="pg_isready", timeout=5)
+        ds = _ds(options={"timeout": 5})
+        engine = PostgresEngine()
+        with pytest.raises(TimeoutError, match="timed out"):
+            engine.check_connectivity(ds)
+
+    @patch("engines.postgres.subprocess.run")
+    def test_check_connectivity_no_timeout_by_default(self, mock_run):
+        """No timeout option → timeout=None passed to subprocess.run."""
+        mock_run.return_value = MagicMock(returncode=0)
+        ds = _ds()
+        engine = PostgresEngine()
+        engine.check_connectivity(ds)
+        assert mock_run.call_args[1]["timeout"] is None
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_dump_timeout_kills_processes(self, mock_popen, tmp_path):
+        """dump timeout → both procs killed."""
+        outfile = tmp_path / "test.sql.gz"
+        ds = _ds(options={"timeout": 5})
+
+        mock_dump = MagicMock()
+        mock_dump.stdout = MagicMock()
+        mock_dump.stdout.close = MagicMock()
+        mock_dump.stderr = MagicMock()
+
+        mock_compress = MagicMock()
+        # First wait raises TimeoutExpired, subsequent waits (after kill) succeed
+        mock_compress.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="gzip", timeout=5),
+            0,  # reap after kill
+        ]
+
+        mock_dump.wait.return_value = 0
+
+        mock_popen.side_effect = [mock_dump, mock_compress]
+
+        engine = PostgresEngine()
+        with pytest.raises(TimeoutError, match="timed out"):
+            engine.dump(ds, str(outfile))
+
+        mock_compress.kill.assert_called_once()
+        mock_dump.kill.assert_called_once()
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_restore_timeout_kills_processes(self, mock_popen, tmp_path):
+        """restore timeout → both procs killed."""
+        infile = tmp_path / "test.sql.gz"
+        infile.write_bytes(b"fake")
+        ds = _ds(options={"timeout": 5})
+
+        mock_decompress = MagicMock()
+        mock_decompress.stdout = MagicMock()
+        mock_decompress.stdout.close = MagicMock()
+
+        mock_restore = MagicMock()
+        mock_restore.communicate.side_effect = subprocess.TimeoutExpired(
+            cmd="psql", timeout=5
+        )
+
+        mock_popen.side_effect = [mock_decompress, mock_restore]
+
+        engine = PostgresEngine()
+        with pytest.raises(TimeoutError, match="timed out"):
+            engine.restore(ds, str(infile))
+
+        mock_restore.kill.assert_called_once()
+        mock_decompress.kill.assert_called_once()
+
+
+class TestPostgresVerify:
+    """Tests for PostgresEngine.verify()."""
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_verify_custom_no_compression(self, mock_popen, tmp_path):
+        """pg_restore --list succeeds → no error."""
+        infile = tmp_path / "test.dump"
+        infile.write_bytes(b"fake custom dump")
+
+        mock_restore = MagicMock()
+        mock_restore.wait.return_value = 0
+        mock_restore.returncode = 0
+        mock_restore.stderr = MagicMock()
+
+        mock_popen.side_effect = [mock_restore]
+
+        engine = PostgresEngine()
+        engine.verify(_ds(), str(infile))  # should not raise
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_verify_custom_no_compression_failure(self, mock_popen, tmp_path):
+        """pg_restore --list fails → RuntimeError."""
+        infile = tmp_path / "test.dump"
+        infile.write_bytes(b"corrupt data")
+
+        mock_restore = MagicMock()
+        mock_restore.wait.return_value = 1
+        mock_restore.returncode = 1
+        mock_restore.stderr = MagicMock()
+        mock_restore.stderr.read.return_value = b"not a valid archive"
+
+        mock_popen.side_effect = [mock_restore]
+
+        engine = PostgresEngine()
+        with pytest.raises(RuntimeError, match="Verification failed"):
+            engine.verify(_ds(), str(infile))
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_verify_custom_with_compression(self, mock_popen, tmp_path):
+        """decompress | pg_restore --list → success."""
+        infile = tmp_path / "test.dump.gz"
+        infile.write_bytes(b"fake compressed dump")
+
+        mock_decompress = MagicMock()
+        mock_decompress.stdout = MagicMock()
+        mock_decompress.stdout.close = MagicMock()
+        mock_decompress.wait.return_value = 0
+        mock_decompress.returncode = 0
+
+        mock_restore = MagicMock()
+        mock_restore.wait.return_value = 0
+        mock_restore.returncode = 0
+
+        mock_popen.side_effect = [mock_decompress, mock_restore]
+
+        engine = PostgresEngine()
+        engine.verify(_ds(), str(infile))  # should not raise
+
+    @patch("engines.postgres.subprocess.Popen")
+    def test_verify_plain_with_compression_valid(self, mock_popen, tmp_path):
+        """decompress header contains SQL markers → success."""
+        infile = tmp_path / "test.sql.gz"
+        infile.write_bytes(b"fake compressed sql")
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = MagicMock()
+        mock_proc.stdout.read.return_value = b"-- PostgreSQL database dump\nSET search_path"
+        mock_proc.wait.return_value = 0
+
+        mock_popen.side_effect = [mock_proc]
+
+        engine = PostgresEngine()
+        engine.verify(_ds(), str(infile))  # should not raise
+
+    def test_verify_plain_no_compression_valid(self, tmp_path):
+        """file header contains SQL markers → success."""
+        infile = tmp_path / "test.sql"
+        infile.write_text("-- PostgreSQL database dump\nSET search_path = public;\n")
+
+        engine = PostgresEngine()
+        engine.verify(_ds(), str(infile))  # should not raise
+
+    def test_verify_plain_no_compression_invalid(self, tmp_path):
+        """binary garbage → RuntimeError."""
+        infile = tmp_path / "test.sql"
+        infile.write_bytes(b"\x00\x01\x02\x03\x04\x05")
+
+        engine = PostgresEngine()
+        with pytest.raises(RuntimeError, match="no SQL markers found"):
+            engine.verify(_ds(), str(infile))
+
+    def test_verify_plain_empty_file(self, tmp_path):
+        """empty → RuntimeError."""
+        infile = tmp_path / "test.sql"
+        infile.write_bytes(b"")
+
+        engine = PostgresEngine()
+        with pytest.raises(RuntimeError, match="empty"):
+            engine.verify(_ds(), str(infile))

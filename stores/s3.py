@@ -7,6 +7,8 @@ import logging
 import boto3
 from botocore.config import Config as BotoConfig
 
+from config import ConfigError
+
 from . import BackupInfo, Store, is_backup_file, parse_timestamp
 
 log = logging.getLogger(__name__)
@@ -79,6 +81,8 @@ class S3Store(Store):
 
 
 def create(config: dict) -> S3Store:
+    if "bucket" not in config:
+        raise ConfigError("Error: S3 store config is missing required 'bucket' field")
     return S3Store(
         bucket=config["bucket"],
         endpoint=config.get("endpoint"),

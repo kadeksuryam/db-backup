@@ -10,6 +10,7 @@ import tempfile
 from config import Datasource, build_prefix
 from engines import create_engine
 from stores import Store
+from utils import sha256_file
 
 log = logging.getLogger(__name__)
 
@@ -71,26 +72,48 @@ def run_restore(
 
     log.info("Selected backup: %s (%s)", target.filename, target.timestamp.strftime("%Y-%m-%d %H:%M:%S"))
 
-    # Check existing data
-    table_count = engine.count_tables(ds)
-    if table_count > 0:
-        if auto_confirm:
-            log.info("Auto-confirming database drop (--auto-confirm).")
-        else:
-            print(f"Database '{ds.database}' already contains {table_count} table(s).")
-            print(f"Connection: {ds.engine}://{ds.user}@{ds.host}:{ds.port}/{ds.database}")
-            answer = input("Drop and recreate the database? [y/N]: ").strip()
-            if answer.lower() not in ("y", "yes"):
-                print("Restore aborted.")
-                sys.exit(0)
-
-        log.info("Dropping and recreating database '%s'...", ds.database)
-        engine.drop_and_recreate(ds)
-
-    # Download and restore
+    # Download and verify first (before touching the database)
     with tempfile.TemporaryDirectory() as tmpdir:
         local_path = os.path.join(tmpdir, target.filename)
         store.download(target.key, local_path)
+
+        log.info("Verifying backup integrity: %s", target.filename)
+        engine.verify(ds, local_path)
+
+        try:
+            checksum_path = os.path.join(tmpdir, target.filename + ".sha256")
+            store.download(target.key + ".sha256", checksum_path)
+            with open(checksum_path) as f:
+                expected = f.read().strip()
+            if len(expected) != 64:
+                raise ValueError("invalid sidecar")
+            actual = sha256_file(local_path)
+            if actual != expected:
+                raise RuntimeError(
+                    f"Checksum mismatch: expected {expected}, got {actual}")
+            log.info("SHA256 checksum verified.")
+        except RuntimeError as e:
+            if "Checksum mismatch" in str(e):
+                raise
+            log.info("No valid SHA256 sidecar — skipping checksum verification.")
+        except Exception:
+            log.info("No SHA256 sidecar found — skipping checksum verification.")
+
+        # Check existing data (only after download+verify succeed)
+        table_count = engine.count_tables(ds)
+        if table_count > 0:
+            if auto_confirm:
+                log.info("Auto-confirming database drop (--auto-confirm).")
+            else:
+                print(f"Database '{ds.database}' already contains {table_count} table(s).")
+                print(f"Connection: {ds.engine}://{ds.user}@{ds.host}:{ds.port}/{ds.database}")
+                answer = input("Drop and recreate the database? [y/N]: ").strip()
+                if answer.lower() not in ("y", "yes"):
+                    print("Restore aborted.")
+                    sys.exit(0)
+
+            log.info("Dropping and recreating database '%s'...", ds.database)
+            engine.drop_and_recreate(ds)
 
         log.info("Restoring '%s' into '%s' (engine: %s)...", target.filename, ds.database, ds.engine)
         engine.restore(ds, local_path)

@@ -24,6 +24,7 @@ datasources:
     # format: plain                   # plain (SQL text, default) or custom (pg_dump -Fc binary)
     # compression: gzip               # gzip (default), zstd, lz4, or none
     # compression_level: 6            # compressor-specific level (gzip=6, zstd=3, lz4=1)
+    # timeout: 3600                   # subprocess timeout in seconds (default: no timeout)
 
   analyticsdb:
     engine: postgres
@@ -56,7 +57,7 @@ stores:
     secret_key_env: R2_SECRET_KEY
     # region: auto                    # optional, defaults to 'auto'
 
-  # SSH/scp remote host
+  # SSH/scp remote host (required: host, user, path)
   backup-server:
     type: ssh
     host: backup.example.com
@@ -64,6 +65,18 @@ stores:
     port: 22
     path: /data/db-backups
     # key_file: /keys/id_ed25519     # optional, defaults to ssh-agent
+
+# Notification backends (optional). Referenced by jobs via 'notify'.
+notifications:
+  email_ops:
+    type: email
+    smtp_host: smtp.example.com
+    smtp_port: 587
+    username_env: SMTP_USER           # reads $SMTP_USER
+    password_env: SMTP_PASS           # reads $SMTP_PASS
+    from: backups@example.com
+    to: ops@example.com
+    use_tls: true
 
 jobs:
   # Each job links a datasource to a store with a prefix and retention policy.
@@ -73,6 +86,14 @@ jobs:
     datasource: appdb
     store: r2
     prefix: prod
+    verify: true                     # download and verify backup integrity after upload
+    retry:
+      max_attempts: 3                # total attempts (1 = no retry, default)
+      delay: 30                      # seconds before first retry
+      backoff_multiplier: 2          # multiplier for each subsequent retry
+    notify:
+      - notifier: email_ops
+        on: failure                  # "failure", "success", or "always"
     retention:
       keep_last: 3                   # always keep the 3 most recent
       keep_daily: 7                  # keep 1 per day for the last 7 days

@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 
 from config import Datasource
 from . import Engine
@@ -73,6 +74,16 @@ def _resolve_compression(ds: Datasource) -> tuple[list[str] | None, list[str] | 
         )
     compress_tpl, decompress_cmd, ext, default_level = _COMPRESSION_TOOLS[compression]
     level = ds.options.get("compression_level", default_level)
+    try:
+        level = int(level)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid compression_level '{level}'. Must be an integer."
+        ) from None
+    if level < 1 or level > 19:
+        raise ValueError(
+            f"compression_level must be between 1 and 19, got {level}"
+        )
     compress_cmd = [part.replace("{level}", str(level)) for part in compress_tpl]
     return compress_cmd, list(decompress_cmd), ext
 
@@ -87,6 +98,17 @@ def _detect_from_extension(filename: str) -> tuple[str, str]:
         if filename.endswith(ext):
             return fmt, comp
     raise ValueError(f"Unrecognized backup file extension: {filename}")
+
+
+def _resolve_timeout(ds: Datasource) -> float | None:
+    """Return the timeout in seconds from datasource options, or None."""
+    timeout = ds.options.get("timeout")
+    if timeout is None:
+        return None
+    timeout = float(timeout)
+    if timeout <= 0:
+        raise ValueError(f"timeout must be positive, got {timeout}")
+    return timeout
 
 
 class PostgresEngine(Engine):
@@ -112,15 +134,47 @@ class PostgresEngine(Engine):
         env["PGDATABASE"] = ds.database
         return env
 
+    def _wait_pipeline(self, procs: list[subprocess.Popen], timeout: float | None) -> None:
+        """Wait for all processes in a pipeline, respecting a shared timeout.
+
+        On timeout: kills all processes and raises TimeoutError.
+        """
+        if timeout is None:
+            for p in procs:
+                p.wait()
+            return
+        deadline = time.monotonic() + timeout
+        for p in procs:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                remaining = 0
+            try:
+                p.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                for q in procs:
+                    q.kill()
+                for q in procs:
+                    q.wait()
+                raise TimeoutError(
+                    f"Pipeline timed out after {timeout}s"
+                ) from None
+
     # -- Engine interface -------------------------------------------------
 
     def check_connectivity(self, ds: Datasource) -> None:
+        timeout = _resolve_timeout(ds)
         log.info("Checking database connectivity: %s@%s:%d/%s", ds.user, ds.host, ds.port, ds.database)
-        result = subprocess.run(
-            [self._pg_bin(ds, "pg_isready"), "-h", ds.host, "-p", str(ds.port), "-U", ds.user, "-d", ds.database],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                [self._pg_bin(ds, "pg_isready"), "-h", ds.host, "-p", str(ds.port), "-U", ds.user, "-d", ds.database],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise TimeoutError(
+                f"Connectivity check timed out after {timeout}s"
+            ) from None
         if result.returncode != 0:
             raise RuntimeError(
                 f"Database is not reachable: {result.stdout.strip()} {result.stderr.strip()}"
@@ -128,22 +182,31 @@ class PostgresEngine(Engine):
         log.info("Database is ready.")
 
     def check_version_compat(self, ds: Datasource) -> None:
+        timeout = _resolve_timeout(ds)
         # Client major version
-        result = subprocess.run(
-            [self._pg_bin(ds, "pg_dump"), "--version"], capture_output=True, text=True
-        )
+        try:
+            result = subprocess.run(
+                [self._pg_bin(ds, "pg_dump"), "--version"],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("pg_dump --version timed out after %ss", timeout)
+            return
         client_match = re.search(r"(\d+)", result.stdout)
         if not client_match:
             return
         client_major = int(client_match.group(1))
 
         # Server major version
-        result = subprocess.run(
-            [self._pg_bin(ds, "psql"), "-tAc", "SHOW server_version_num;"],
-            env=self._pg_env(ds),
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                [self._pg_bin(ds, "psql"), "-tAc", "SHOW server_version_num;"],
+                env=self._pg_env(ds),
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("Server version query timed out after %ss", timeout)
+            return
         if result.returncode != 0:
             return
         try:
@@ -166,6 +229,7 @@ class PostgresEngine(Engine):
             )
 
     def dump(self, ds: Datasource, output_path: str) -> None:
+        timeout = _resolve_timeout(ds)
         pg_env = self._pg_env(ds)
         fmt = _resolve_format(ds)
         compress_cmd, _, _ = _resolve_compression(ds)
@@ -192,8 +256,7 @@ class PostgresEngine(Engine):
                 )
                 # Allow dump to receive SIGPIPE if compressor exits early
                 dump_proc.stdout.close()
-                compress_proc.wait()
-                dump_proc.wait()
+                self._wait_pipeline([compress_proc, dump_proc], timeout)
             else:
                 # No compression — write pg_dump output directly
                 dump_proc = subprocess.Popen(
@@ -202,13 +265,20 @@ class PostgresEngine(Engine):
                     stdout=outfile,
                     stderr=subprocess.PIPE,
                 )
-                dump_proc.wait()
+                self._wait_pipeline([dump_proc], timeout)
 
+        errors = []
         if dump_proc.returncode != 0:
             stderr = dump_proc.stderr.read().decode().strip() if dump_proc.stderr else ""
-            raise RuntimeError(f"pg_dump failed (exit {dump_proc.returncode}): {stderr}")
+            errors.append(f"pg_dump failed (exit {dump_proc.returncode}): {stderr}")
+        if compress_cmd is not None and compress_proc.returncode != 0:
+            stderr = compress_proc.stderr.read().decode().strip() if compress_proc.stderr else ""
+            errors.append(f"compressor failed (exit {compress_proc.returncode}): {stderr}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
     def restore(self, ds: Datasource, input_path: str) -> None:
+        timeout = _resolve_timeout(ds)
         env = self._pg_env(ds)
 
         # Detect format and compression from the file extension, not from
@@ -245,7 +315,16 @@ class PostgresEngine(Engine):
                     stderr=subprocess.PIPE,
                 )
                 decompress_proc.stdout.close()
-                restore_out, restore_err = restore_proc.communicate()
+                try:
+                    restore_out, restore_err = restore_proc.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    restore_proc.kill()
+                    decompress_proc.kill()
+                    restore_proc.wait()
+                    decompress_proc.wait()
+                    raise TimeoutError(
+                        f"Restore timed out after {timeout}s"
+                    ) from None
                 decompress_proc.wait()
         else:
             with open(input_path, "rb") as infile:
@@ -256,29 +335,47 @@ class PostgresEngine(Engine):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                 )
-                restore_out, restore_err = restore_proc.communicate()
+                try:
+                    restore_out, restore_err = restore_proc.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    restore_proc.kill()
+                    restore_proc.wait()
+                    raise TimeoutError(
+                        f"Restore timed out after {timeout}s"
+                    ) from None
 
+        errors = []
+        if compression != "none" and decompress_proc.returncode != 0:
+            stderr = decompress_proc.stderr.read().decode().strip() if decompress_proc.stderr else ""
+            errors.append(f"decompressor failed (exit {decompress_proc.returncode}): {stderr}")
         if restore_proc.returncode != 0:
             tool = "psql" if fmt == "plain" else "pg_restore"
-            raise RuntimeError(
-                f"{tool} restore failed (exit {restore_proc.returncode}): {restore_err.decode().strip()}"
-            )
+            errors.append(f"{tool} restore failed (exit {restore_proc.returncode}): {restore_err.decode().strip()}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
     def count_tables(self, ds: Datasource) -> int:
-        result = subprocess.run(
-            [
-                self._pg_bin(ds, "psql"), "-tAc",
-                "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public';",
-            ],
-            env=self._pg_env(ds),
-            capture_output=True,
-            text=True,
-        )
+        timeout = _resolve_timeout(ds)
+        try:
+            result = subprocess.run(
+                [
+                    self._pg_bin(ds, "psql"), "-tAc",
+                    "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public';",
+                ],
+                env=self._pg_env(ds),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("count_tables timed out after %ss", timeout)
+            return 0
         if result.returncode != 0:
             return 0
         return int(result.stdout.strip() or "0")
 
     def drop_and_recreate(self, ds: Datasource) -> None:
+        timeout = _resolve_timeout(ds)
         _validate_identifier(ds.database)
 
         env = self._pg_env(ds)
@@ -293,12 +390,18 @@ class PostgresEngine(Engine):
             f"DROP DATABASE IF EXISTS \"{db}\";\n"
             f"CREATE DATABASE \"{db}\";\n"
         )
-        result = subprocess.run(
-            [self._pg_bin(ds, "psql"), "-c", sql],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                [self._pg_bin(ds, "psql"), "-c", sql],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise TimeoutError(
+                f"drop_and_recreate timed out after {timeout}s"
+            ) from None
         if result.returncode != 0:
             raise RuntimeError(f"Failed to recreate database: {result.stderr.strip()}")
 
@@ -307,6 +410,84 @@ class PostgresEngine(Engine):
         _, _, comp_ext = _resolve_compression(ds)
         base = ".sql" if fmt == "plain" else ".dump"
         return f"{base}{comp_ext}"
+
+    def verify(self, ds: Datasource, file_path: str) -> None:
+        fmt, compression = _detect_from_extension(file_path)
+        timeout = _resolve_timeout(ds)
+        if fmt == "custom":
+            self._verify_custom(ds, file_path, compression, timeout)
+        else:
+            self._verify_plain(ds, file_path, compression, timeout)
+
+    def _verify_custom(self, ds: Datasource, file_path: str, compression: str, timeout: float | None) -> None:
+        """Verify a custom-format backup using pg_restore --list."""
+        pg_restore_cmd = [self._pg_bin(ds, "pg_restore"), "--list"]
+
+        if compression != "none":
+            _, decompress_cmd, _, _ = _COMPRESSION_TOOLS[compression]
+            decompress_cmd = list(decompress_cmd)
+
+            with open(file_path, "rb") as infile:
+                decompress_proc = subprocess.Popen(
+                    decompress_cmd,
+                    stdin=infile,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                restore_proc = subprocess.Popen(
+                    pg_restore_cmd,
+                    stdin=decompress_proc.stdout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                decompress_proc.stdout.close()
+                self._wait_pipeline([restore_proc, decompress_proc], timeout)
+        else:
+            restore_proc = subprocess.Popen(
+                pg_restore_cmd + [file_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self._wait_pipeline([restore_proc], timeout)
+
+        errors = []
+        if compression != "none" and decompress_proc.returncode != 0:
+            stderr = decompress_proc.stderr.read().decode().strip() if decompress_proc.stderr else ""
+            errors.append(f"decompressor failed (exit {decompress_proc.returncode}): {stderr}")
+        if restore_proc.returncode != 0:
+            stderr = restore_proc.stderr.read().decode().strip() if restore_proc.stderr else ""
+            errors.append(f"pg_restore --list failed (exit {restore_proc.returncode}): {stderr}")
+        if errors:
+            raise RuntimeError(f"Verification failed: {'; '.join(errors)}")
+
+    def _verify_plain(self, ds: Datasource, file_path: str, compression: str, timeout: float | None) -> None:
+        """Verify a plain-format backup by checking for SQL markers in the header."""
+        sql_markers = ("--", "SET ", "CREATE ", "ALTER ", "INSERT ", "SELECT ", "BEGIN", "COPY ")
+
+        if compression != "none":
+            _, decompress_cmd, _, _ = _COMPRESSION_TOOLS[compression]
+            decompress_cmd = list(decompress_cmd)
+
+            with open(file_path, "rb") as infile:
+                proc = subprocess.Popen(
+                    decompress_cmd,
+                    stdin=infile,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                header = proc.stdout.read(4096)
+                proc.kill()
+                proc.wait()
+        else:
+            with open(file_path, "rb") as f:
+                header = f.read(4096)
+
+        if not header:
+            raise RuntimeError("Verification failed: backup file is empty")
+
+        text = header.decode("utf-8", errors="replace")
+        if not any(marker in text for marker in sql_markers):
+            raise RuntimeError("Verification failed: no SQL markers found in backup header")
 
 
 def create() -> PostgresEngine:

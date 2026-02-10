@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -192,8 +193,12 @@ class TestApplyRetention:
                 deleted.append(key)
 
         apply_retention(FakeStore(), "pfx", "db", RetentionPolicy(keep_last=2))
-        # b0, b1 kept; b2, b3, b4 deleted
-        assert set(deleted) == {"b2", "b3", "b4"}
+        # b0, b1 kept; b2, b3, b4 deleted (plus their .sha256 sidecars)
+        assert set(deleted) == {
+            "b2", "b2.sha256",
+            "b3", "b3.sha256",
+            "b4", "b4.sha256",
+        }
 
     def test_all_kept_nothing_deleted(self):
         """When policy keeps everything, delete is never called."""
@@ -216,6 +221,30 @@ class TestApplyRetention:
 
         apply_retention(FakeStore(), "prod", "mydb", RetentionPolicy(keep_last=1))
         assert listed_prefix == ["prod/mydb"]
+
+    def test_dry_run_no_deletes(self):
+        """dry_run=True → store.delete never called."""
+        class FakeStore:
+            def list(self, prefix):
+                return [_bi(f"b{i}", i) for i in range(5)]
+            def delete(self, key):
+                pytest.fail("delete should not be called in dry run")
+
+        apply_retention(FakeStore(), "pfx", "db", RetentionPolicy(keep_last=2), dry_run=True)
+
+    def test_dry_run_logs_what_would_delete(self, caplog):
+        """dry_run=True → logs 'Would delete' and 'Dry run: would prune'."""
+
+        class FakeStore:
+            def list(self, prefix):
+                return [_bi(f"b{i}", i) for i in range(3)]
+            def delete(self, key):
+                pytest.fail("delete should not be called in dry run")
+
+        with caplog.at_level(logging.INFO):
+            apply_retention(FakeStore(), "pfx", "db", RetentionPolicy(keep_last=1), dry_run=True)
+        assert "Would delete" in caplog.text
+        assert "Dry run: would prune" in caplog.text
 
 
 class TestRetentionEdgeCases:
@@ -289,6 +318,39 @@ class TestRetentionEdgeCases:
 
         with pytest.raises(RuntimeError, match="S3 permission denied"):
             apply_retention(FakeStore(), "pfx", "db", RetentionPolicy(keep_last=1))
+
+    def test_sidecar_deleted_with_backup(self):
+        """When a backup is deleted, its .sha256 sidecar is also deleted."""
+        deleted = []
+
+        class FakeStore:
+            def list(self, prefix):
+                return [_bi(f"b{i}", i) for i in range(3)]
+            def delete(self, key):
+                deleted.append(key)
+
+        apply_retention(FakeStore(), "pfx", "db", RetentionPolicy(keep_last=1))
+        # b1 and b2 deleted, plus their sidecars
+        assert "b1" in deleted
+        assert "b1.sha256" in deleted
+        assert "b2" in deleted
+        assert "b2.sha256" in deleted
+
+    def test_sidecar_deletion_failure_silenced(self):
+        """If sidecar deletion fails, it is silenced (sidecar may not exist)."""
+        deleted = []
+
+        class FakeStore:
+            def list(self, prefix):
+                return [_bi(f"b{i}", i) for i in range(2)]
+            def delete(self, key):
+                if key.endswith(".sha256"):
+                    raise RuntimeError("not found")
+                deleted.append(key)
+
+        # Should not raise
+        apply_retention(FakeStore(), "pfx", "db", RetentionPolicy(keep_last=1))
+        assert "b1" in deleted
 
     def test_leap_year_monthly(self):
         """Monthly retention spanning Feb 28/29 in a leap year."""

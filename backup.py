@@ -11,12 +11,13 @@ from datetime import datetime, timezone
 from config import Datasource, build_prefix
 from engines import create_engine
 from stores import Store
+from utils import sha256_file
 
 log = logging.getLogger(__name__)
 
 
-def run_backup(ds: Datasource, store: Store, prefix: str) -> str:
-    """Run a full backup cycle: dump -> upload.
+def run_backup(ds: Datasource, store: Store, prefix: str, verify: bool = False) -> str:
+    """Run a full backup cycle: dump -> upload -> optionally verify.
 
     Returns the remote key of the uploaded backup.
     """
@@ -41,7 +42,27 @@ def run_backup(ds: Datasource, store: Store, prefix: str) -> str:
         size_mb = os.path.getsize(local_path) / (1024 * 1024)
         log.info("Dump completed in %.1fs (%.1f MB compressed)", elapsed, size_mb)
 
+        if os.path.getsize(local_path) == 0:
+            raise RuntimeError(
+                f"Dump produced an empty (0-byte) file for '{ds.database}'. "
+                f"This could indicate a problem with the database or engine."
+            )
+
         store.upload(local_path, remote_key)
+
+        checksum = sha256_file(local_path)
+        checksum_path = local_path + ".sha256"
+        with open(checksum_path, "w") as f:
+            f.write(checksum)
+        store.upload(checksum_path, remote_key + ".sha256")
+        log.info("SHA256 sidecar uploaded: %s", checksum)
+
+        if verify:
+            verify_path = os.path.join(tmpdir, f"verify-{filename}")
+            log.info("Verifying backup: %s", remote_key)
+            store.download(remote_key, verify_path)
+            engine.verify(ds, verify_path)
+            log.info("Backup verification passed.")
 
     log.info("Backup complete: %s", remote_key)
     return remote_key

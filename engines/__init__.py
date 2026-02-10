@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 from abc import ABC, abstractmethod
 
-from config import Datasource
+from config import ConfigError, Datasource
 
 
 class Engine(ABC):
@@ -39,6 +39,10 @@ class Engine(ABC):
     def file_extension(self, ds: Datasource) -> str:
         """Return the backup file extension based on datasource options (e.g. '.sql.gz')."""
 
+    @abstractmethod
+    def verify(self, ds: Datasource, file_path: str) -> None:
+        """Verify a backup file's integrity. Raises RuntimeError if invalid."""
+
 
 # Map of engine type names to module names within this package.
 _ENGINE_TYPES = {
@@ -52,7 +56,7 @@ def create_engine(engine_type: str) -> Engine:
     The engine_type must match a key in _ENGINE_TYPES (e.g. 'postgres').
     """
     if engine_type not in _ENGINE_TYPES:
-        raise ValueError(
+        raise ConfigError(
             f"Unknown engine type '{engine_type}'. "
             f"Available: {', '.join(_ENGINE_TYPES)}"
         )

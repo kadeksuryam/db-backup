@@ -6,6 +6,7 @@ Currently supports **PostgreSQL** with S3-compatible and SSH storage. Designed t
 
 ## Features
 
+- **Encryption at rest** — pluggable encryption layer (age, GPG, AES-256-GCM) between dump and upload
 - **Multi-engine architecture** — pluggable database backends via the `engines/` package
 - **Multiple storage backends** — S3-compatible (AWS S3, Cloudflare R2, MinIO) and SSH/scp
 - **GFS retention** — Grandfather-Father-Son pruning (keep_last, daily, weekly, monthly, yearly) with dry-run support
@@ -39,6 +40,11 @@ dbbackup/
 │   ├── __init__.py        # Store ABC + factory + parse_timestamp
 │   ├── s3.py              # S3-compatible storage (boto3)
 │   └── ssh.py             # SSH/scp storage
+├── encryptors/
+│   ├── __init__.py        # Encryptor ABC + factory
+│   ├── age.py             # Age encryption (recommended)
+│   ├── gpg.py             # GPG encryption
+│   └── aes256gcm.py       # AES-256-GCM (pure Python)
 ├── notifiers/
 │   ├── __init__.py        # Notifier ABC + factory
 │   └── email.py           # Email notification (SMTP)
@@ -67,7 +73,7 @@ Copy and edit the example config:
 cp config.example.yaml config.yaml
 ```
 
-The config file has four sections: **datasources**, **stores**, **notifications** (optional), and **jobs**.
+The config file has five sections: **datasources**, **stores**, **notifications** (optional), **encryption** (optional), and **jobs**.
 
 ### Datasources
 
@@ -166,6 +172,46 @@ notifications:
 
 The `to` field accepts a single email address (string), a comma-separated string, or a YAML list.
 
+### Encryption
+
+Define named encryption profiles (optional). Supported backends:
+
+| Backend | Binary | Config Keys | File Suffix |
+|---------|--------|-------------|-------------|
+| `age` | `age` (external) | `recipients`, `recipient`, `identity`, `passphrase_env` | `.age` |
+| `gpg` | `gpg` (external) | `key_id`, `passphrase_env`, `gpg_binary` | `.gpg` |
+| `aes-256-gcm` | None (pure Python) | `key_env`/`key`, `key_file` | `.enc` |
+
+```yaml
+encryption:
+  prod-age:
+    type: age
+    recipients:
+      - age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+    identity: /keys/backup-key.txt
+
+  prod-aes:
+    type: aes-256-gcm
+    key_env: BACKUP_AES_KEY    # 64-char hex for 32 bytes
+```
+
+Jobs reference encryption profiles by name, or use inline config:
+
+```yaml
+jobs:
+  my-job:
+    datasource: appdb
+    store: r2
+    encryption: prod-age       # named profile
+    # OR inline:
+    # encryption:
+    #   type: age
+    #   recipients: [age1...]
+    #   identity: /keys/key.txt
+```
+
+Encrypted backups have the encryption suffix appended (e.g. `mydb-20260101-120000.sql.gz.age`). Secrets use `*_env` keys to reference environment variables, and identity/key files can be mounted into the container.
+
 ### Jobs
 
 Link datasources to stores with a prefix and optional settings:
@@ -176,6 +222,7 @@ jobs:
     datasource: appdb
     store: r2
     prefix: prod
+    encryption: prod-age             # optional: named encryption profile
     verify: true                     # download + verify after upload
     retry:
       max_attempts: 3                # total attempts (1 = no retry, default)
@@ -252,10 +299,11 @@ docker run --rm -v ... -e ... dbbackup restore appdb-backup --auto-confirm
 
 The restore process:
 1. Downloads the backup file
-2. Verifies backup integrity (file structure check)
-3. Verifies SHA256 checksum if a `.sha256` sidecar exists
-4. Checks for existing tables and prompts before dropping
-5. Restores the backup
+2. Verifies SHA256 checksum if a `.sha256` sidecar exists
+3. Decrypts the file (if encryption is configured for the job)
+4. Verifies backup integrity (file structure check)
+5. Checks for existing tables and prompts before dropping
+6. Restores the backup
 
 ### Prune (Apply Retention)
 
@@ -336,3 +384,10 @@ python -m pytest tests/test_retention.py -v
 1. Create `stores/<name>.py` implementing the `Store` ABC
 2. Add the store to `_STORE_TYPES` in `stores/__init__.py`
 3. Add `create(config: dict)` factory function to the new module
+
+## Adding a New Encryptor
+
+1. Create `encryptors/<name>.py` implementing the `Encryptor` ABC (`encrypt`, `decrypt`, `file_suffix`)
+2. Add the encryptor to `_ENCRYPTOR_TYPES` in `encryptors/__init__.py`
+3. Add `create(config: dict)` factory function to the new module
+4. Add the new file suffix to `_ENCRYPTION_SUFFIXES` in `stores/__init__.py`

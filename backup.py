@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 
 from config import Datasource, build_prefix
+from encryptors import create_encryptor
 from engines import create_engine
 from stores import Store
 from utils import sha256_file
@@ -16,8 +17,14 @@ from utils import sha256_file
 log = logging.getLogger(__name__)
 
 
-def run_backup(ds: Datasource, store: Store, prefix: str, verify: bool = False) -> str:
-    """Run a full backup cycle: dump -> upload -> optionally verify.
+def run_backup(
+    ds: Datasource,
+    store: Store,
+    prefix: str,
+    verify: bool = False,
+    encryption_config: dict | None = None,
+) -> str:
+    """Run a full backup cycle: dump -> encrypt -> upload -> optionally verify.
 
     Returns the remote key of the uploaded backup.
     """
@@ -48,6 +55,16 @@ def run_backup(ds: Datasource, store: Store, prefix: str, verify: bool = False) 
                 f"This could indicate a problem with the database or engine."
             )
 
+        encryptor = create_encryptor(encryption_config) if encryption_config else None
+
+        if encryptor:
+            encrypted_path = local_path + encryptor.file_suffix()
+            encryptor.encrypt(local_path, encrypted_path)
+            os.remove(local_path)
+            local_path = encrypted_path
+            filename = filename + encryptor.file_suffix()
+            remote_key = f"{build_prefix(prefix, ds.database)}/{filename}"
+
         store.upload(local_path, remote_key)
 
         checksum = sha256_file(local_path)
@@ -61,7 +78,12 @@ def run_backup(ds: Datasource, store: Store, prefix: str, verify: bool = False) 
             verify_path = os.path.join(tmpdir, f"verify-{filename}")
             log.info("Verifying backup: %s", remote_key)
             store.download(remote_key, verify_path)
-            engine.verify(ds, verify_path)
+            if encryptor:
+                decrypted_path = os.path.join(tmpdir, f"verify-decrypted-{filename}")
+                encryptor.decrypt(verify_path, decrypted_path)
+                engine.verify(ds, decrypted_path)
+            else:
+                engine.verify(ds, verify_path)
             log.info("Backup verification passed.")
 
     log.info("Backup complete: %s", remote_key)

@@ -67,7 +67,8 @@ def _run_single_job(name: str, raw_config: dict, prune: bool, dry_run: bool = Fa
                                 name, attempt - 1, job.retry.max_attempts, delay)
                     time.sleep(delay)
                     log.info("=== Job: %s (attempt %d/%d) ===", name, attempt, job.retry.max_attempts)
-                run_backup(job.datasource, store, job.prefix, verify=job.verify)
+                run_backup(job.datasource, store, job.prefix, verify=job.verify,
+                           encryption_config=job.encryption_config)
                 last_exc = None
                 break
             except ConfigError:
@@ -170,6 +171,7 @@ def cmd_restore(args: argparse.Namespace, raw_config: dict) -> None:
             job.prefix,
             filename=args.filename,
             auto_confirm=args.auto_confirm,
+            encryption_config=job.encryption_config,
         )
 
 

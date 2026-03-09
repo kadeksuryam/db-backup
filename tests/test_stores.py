@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from config import ConfigError
-from stores import create_store, BackupInfo, BACKUP_EXTENSIONS, Store
+from stores import create_store, BackupInfo, BACKUP_EXTENSIONS, Store, parse_timestamp, is_backup_file
 from stores.s3 import S3Store
 from stores.ssh import SSHStore
 
@@ -379,6 +379,45 @@ class TestSSHStore:
             assert f"'*{ext}'" in ssh_cmd_str
         # Verify -printf is used instead of shell pipeline
         assert "-printf" in ssh_cmd_str
+
+
+class TestEncryptedExtensions:
+    """Encrypted file extensions are recognized by BACKUP_EXTENSIONS."""
+
+    def test_encrypted_extensions_in_list(self):
+        """All encrypted variants should be in BACKUP_EXTENSIONS."""
+        assert ".sql.gz.age" in BACKUP_EXTENSIONS
+        assert ".sql.gz.gpg" in BACKUP_EXTENSIONS
+        assert ".sql.gz.enc" in BACKUP_EXTENSIONS
+        assert ".dump.zst.age" in BACKUP_EXTENSIONS
+        assert ".dump.lz4.gpg" in BACKUP_EXTENSIONS
+        assert ".sql.enc" in BACKUP_EXTENSIONS
+
+    def test_encrypted_before_plain(self):
+        """Encrypted variants appear before their plain counterparts (longest match first)."""
+        age_idx = BACKUP_EXTENSIONS.index(".sql.gz.age")
+        plain_idx = BACKUP_EXTENSIONS.index(".sql.gz")
+        assert age_idx < plain_idx
+
+    def test_is_backup_file_encrypted(self):
+        assert is_backup_file("db-20260101-120000.sql.gz.age")
+        assert is_backup_file("db-20260101-120000.dump.zst.gpg")
+        assert is_backup_file("db-20260101-120000.sql.enc")
+
+    def test_parse_timestamp_encrypted(self):
+        """parse_timestamp works with encrypted extensions."""
+        ts = parse_timestamp("db-20260101-120000.sql.gz.age")
+        assert ts is not None
+        assert ts.year == 2026
+        assert ts.month == 1
+
+        ts2 = parse_timestamp("db-20260210-143000.dump.zst.gpg")
+        assert ts2 is not None
+        assert ts2.day == 10
+
+        ts3 = parse_timestamp("db-20260315-090000.sql.enc")
+        assert ts3 is not None
+        assert ts3.month == 3
 
 
 class TestCreateStoreEdgeCases:

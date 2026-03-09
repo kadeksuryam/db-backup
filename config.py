@@ -73,6 +73,7 @@ class Job:
     verify: bool = False
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     notifications: list[NotificationRule] = field(default_factory=list)
+    encryption_config: dict | None = None
 
 
 def load(config_path: str | None = None) -> dict:
@@ -184,6 +185,43 @@ def get_store_config(raw_config: dict, name: str) -> dict:
     return resolve_env(stores[name])
 
 
+def get_encryption_config(raw_config: dict, job_cfg: dict, job_name: str) -> dict | None:
+    """Resolve the encryption config for a job.
+
+    The 'encryption' value can be:
+    - Absent/None: no encryption
+    - A string: reference to a named profile in the top-level 'encryption' section
+    - A dict: inline encryption config
+    """
+    enc = job_cfg.get("encryption")
+    if enc is None:
+        return None
+
+    if isinstance(enc, str):
+        # Named profile reference
+        profiles = raw_config.get("encryption", {})
+        if enc not in profiles:
+            raise ConfigError(
+                f"Error: job '{job_name}' references encryption profile '{enc}' "
+                f"which is not defined. Available: {', '.join(profiles) if profiles else '(none)'}"
+            )
+        enc_cfg = resolve_env(profiles[enc])
+    elif isinstance(enc, dict):
+        enc_cfg = resolve_env(enc)
+    else:
+        raise ConfigError(
+            f"Error: job '{job_name}' has invalid 'encryption' value — "
+            f"must be a string (profile name) or dict (inline config)"
+        )
+
+    if "type" not in enc_cfg:
+        raise ConfigError(
+            f"Error: encryption config for job '{job_name}' is missing required 'type' field"
+        )
+
+    return enc_cfg
+
+
 def get_job(raw_config: dict, name: str) -> Job:
     """Get a fully resolved Job by name."""
     jobs = raw_config.get("jobs", {})
@@ -254,6 +292,8 @@ def get_job(raw_config: dict, name: str) -> Job:
             )
         notifications.append(NotificationRule(notifier_name=notifier_name, on=on))
 
+    encryption_config = get_encryption_config(raw_config, job_cfg, name)
+
     return Job(
         name=name,
         datasource=ds,
@@ -263,6 +303,7 @@ def get_job(raw_config: dict, name: str) -> Job:
         verify=bool(job_cfg.get("verify", False)),
         retry=retry,
         notifications=notifications,
+        encryption_config=encryption_config,
     )
 
 

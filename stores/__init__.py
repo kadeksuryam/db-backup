@@ -12,11 +12,19 @@ from config import ConfigError
 
 # All recognized backup file extensions, compound extensions first so
 # they are matched before their shorter suffixes.
-BACKUP_EXTENSIONS = [
+# Encrypted variants (longest match) must come before their plain counterparts.
+_BASE_EXTENSIONS = [
     ".sql.gz", ".sql.zst", ".sql.lz4",
     ".dump.gz", ".dump.zst", ".dump.lz4",
     ".sql", ".dump",
 ]
+_ENCRYPTION_SUFFIXES = [".age", ".gpg", ".enc"]
+
+BACKUP_EXTENSIONS = [
+    base + enc
+    for base in _BASE_EXTENSIONS
+    for enc in _ENCRYPTION_SUFFIXES
+] + _BASE_EXTENSIONS
 
 
 def is_backup_file(filename: str) -> bool:

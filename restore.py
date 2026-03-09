@@ -7,6 +7,7 @@ import os
 import tempfile
 
 from config import Datasource, build_prefix
+from encryptors import create_encryptor
 from engines import create_engine
 from stores import BackupInfo, Store
 from utils import format_size, sha256_file
@@ -47,6 +48,7 @@ def run_restore(
     prefix: str,
     filename: str | None = None,
     auto_confirm: bool = False,
+    encryption_config: dict | None = None,
 ) -> None:
     """Download and restore a backup.
 
@@ -81,9 +83,6 @@ def run_restore(
         local_path = os.path.join(tmpdir, target.filename)
         store.download(target.key, local_path)
 
-        log.info("Verifying backup integrity: %s", target.filename)
-        engine.verify(ds, local_path)
-
         # Try to verify checksum via .sha256 sidecar.
         # Download failures or invalid sidecars are non-fatal (backwards compat),
         # but a genuine checksum mismatch is always fatal.
@@ -106,6 +105,24 @@ def run_restore(
             log.info("SHA256 checksum verified.")
         else:
             log.info("No SHA256 sidecar found — skipping checksum verification.")
+
+        if encryption_config:
+            encryptor = create_encryptor(encryption_config)
+            suffix = encryptor.file_suffix()
+            if not target.filename.endswith(suffix):
+                raise RuntimeError(
+                    f"Backup file '{target.filename}' does not have expected "
+                    f"encryption suffix '{suffix}'"
+                )
+            decrypted_name = target.filename.removesuffix(suffix)
+            decrypted_path = os.path.join(tmpdir, decrypted_name)
+            encryptor.decrypt(local_path, decrypted_path)
+            os.remove(local_path)
+            local_path = decrypted_path
+            log.info("Decryption complete: %s", decrypted_name)
+
+        log.info("Verifying backup integrity: %s", target.filename)
+        engine.verify(ds, local_path)
 
         # Check existing data (only after download+verify succeed)
         table_count = engine.count_tables(ds)

@@ -521,6 +521,95 @@ class TestNotificationConfig:
         assert "password_env" not in cfg
 
 
+class TestEncryptionConfig:
+    def _make_config(self, encryption=None, job_encryption=None):
+        cfg = {
+            "datasources": {
+                "ds1": {
+                    "engine": "postgres",
+                    "host": "localhost",
+                    "port": 5432,
+                    "user": "u",
+                    "password": "p",
+                    "database": "db1",
+                }
+            },
+            "stores": {"s1": {"type": "s3", "bucket": "b"}},
+            "jobs": {
+                "job1": {
+                    "datasource": "ds1",
+                    "store": "s1",
+                }
+            },
+        }
+        if encryption is not None:
+            cfg["encryption"] = encryption
+        if job_encryption is not None:
+            cfg["jobs"]["job1"]["encryption"] = job_encryption
+        return cfg
+
+    def test_job_no_encryption(self):
+        raw = self._make_config()
+        job = config.get_job(raw, "job1")
+        assert job.encryption_config is None
+
+    def test_job_inline_encryption(self):
+        raw = self._make_config(
+            job_encryption={"type": "age", "recipients": ["age1test"]},
+        )
+        job = config.get_job(raw, "job1")
+        assert job.encryption_config is not None
+        assert job.encryption_config["type"] == "age"
+        assert job.encryption_config["recipients"] == ["age1test"]
+
+    def test_job_named_profile_reference(self):
+        raw = self._make_config(
+            encryption={"prod-age": {"type": "age", "recipients": ["age1test"]}},
+            job_encryption="prod-age",
+        )
+        job = config.get_job(raw, "job1")
+        assert job.encryption_config is not None
+        assert job.encryption_config["type"] == "age"
+
+    def test_missing_profile_raises(self):
+        raw = self._make_config(
+            encryption={"other": {"type": "age", "recipients": ["age1test"]}},
+            job_encryption="nonexistent",
+        )
+        with pytest.raises(ConfigError, match="not defined"):
+            config.get_job(raw, "job1")
+
+    def test_missing_type_raises(self):
+        raw = self._make_config(
+            job_encryption={"recipients": ["age1test"]},
+        )
+        with pytest.raises(ConfigError, match="missing required 'type'"):
+            config.get_job(raw, "job1")
+
+    def test_env_var_resolution(self, monkeypatch):
+        monkeypatch.setenv("MY_AES_KEY", "a" * 64)
+        raw = self._make_config(
+            job_encryption={"type": "aes-256-gcm", "key_env": "MY_AES_KEY"},
+        )
+        job = config.get_job(raw, "job1")
+        assert job.encryption_config["key"] == "a" * 64
+        assert "key_env" not in job.encryption_config
+
+    def test_invalid_encryption_value_raises(self):
+        raw = self._make_config(job_encryption=42)
+        with pytest.raises(ConfigError, match="invalid 'encryption' value"):
+            config.get_job(raw, "job1")
+
+    def test_named_profile_env_resolution(self, monkeypatch):
+        monkeypatch.setenv("ENC_KEY", "b" * 64)
+        raw = self._make_config(
+            encryption={"prof": {"type": "aes-256-gcm", "key_env": "ENC_KEY"}},
+            job_encryption="prof",
+        )
+        job = config.get_job(raw, "job1")
+        assert job.encryption_config["key"] == "b" * 64
+
+
 class TestConfigFilePermissions:
     """Security: warn if config file is readable by group/others."""
 

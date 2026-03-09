@@ -484,10 +484,12 @@ class TestRestoreVerification:
 
         run_restore(_ds(), store, "prod")
 
-        # download → verify → download (sidecar) → restore
+        # download → download (sidecar) → verify → restore
         assert call_order[0] == "download"
-        assert call_order[1] == "verify"
-        assert call_order[-1] == "restore"
+        assert "verify" in call_order
+        verify_idx = call_order.index("verify")
+        restore_idx = call_order.index("restore")
+        assert verify_idx < restore_idx
 
     @patch("restore.create_engine")
     def test_verify_failure_prevents_restore(self, mock_create_engine):
